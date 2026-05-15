@@ -4,6 +4,7 @@ __pycache__/
 *.pyd
 
 outputs/
+data/
 
 .venv/
 venv/
@@ -13,3 +14,7 @@ env/
 Thumbs.db
 
 *.log
+*.mp4
+*.avi
+*.mov
+*.zip
