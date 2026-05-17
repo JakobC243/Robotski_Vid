@@ -15,8 +15,6 @@ def main() -> None:
 
     args.disable_pins = True
     args.velocity_center_source = "ma"
-    if args.ma_window == 5:
-        args.ma_window = 3
     if args.speed_ema_alpha == 0.35:
         args.speed_ema_alpha = 0.30
 

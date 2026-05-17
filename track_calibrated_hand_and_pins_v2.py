@@ -15,8 +15,6 @@ def main() -> None:
 
     args.disable_pins = False
     args.velocity_center_source = "ma"
-    if args.ma_window == 5:
-        args.ma_window = 3
 
     if args.calibration_only:
         process_calibration_only(args)

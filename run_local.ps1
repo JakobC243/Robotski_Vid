@@ -9,7 +9,9 @@ param(
     [int]$Limit = 0,
     [int]$MaxFrames = 0,
     [int]$TrainFrames = 100,
-    [int]$FrameSamples = 120
+    [int]$FrameSamples = 120,
+    [int]$VelocityWindowFrames = 3,
+    [int]$AccelerationWindowFrames = 5
 )
 
 $ErrorActionPreference = "Stop"
@@ -53,7 +55,9 @@ elseif ($Mode -eq "hand-calib") {
         --video $ResolvedVideo `
         --output-root $ResolvedOutput `
         --frame-samples $FrameSamples `
-        --max-frames $MaxFrames
+        --max-frames $MaxFrames `
+        --velocity-window-frames $VelocityWindowFrames `
+        --acceleration-window-frames $AccelerationWindowFrames
 }
 elseif ($Mode -eq "pins-v2") {
     $ResolvedVideo = Resolve-ProjectPath $Video
@@ -61,7 +65,9 @@ elseif ($Mode -eq "pins-v2") {
         --video $ResolvedVideo `
         --output-root $ResolvedOutput `
         --frame-samples $FrameSamples `
-        --max-frames $MaxFrames
+        --max-frames $MaxFrames `
+        --velocity-window-frames $VelocityWindowFrames `
+        --acceleration-window-frames $AccelerationWindowFrames
 }
 elseif ($Mode -eq "calib") {
     $ResolvedVideo = Resolve-ProjectPath $Video
@@ -84,7 +90,9 @@ elseif ($Mode -eq "full") {
         --video $ResolvedVideo `
         --output-root $ResolvedOutput `
         --frame-samples $FrameSamples `
-        --max-frames $MaxFrames
+        --max-frames $MaxFrames `
+        --velocity-window-frames $VelocityWindowFrames `
+        --acceleration-window-frames $AccelerationWindowFrames
 }
 elseif ($Mode -eq "batch-calib") {
     $ResolvedInputRoot = Resolve-ProjectPath $InputRoot
@@ -105,6 +113,8 @@ elseif ($Mode -eq "batch-hand") {
         --mode hand `
         --frame-samples $FrameSamples `
         --max-frames $MaxFrames `
+        --velocity-window-frames $VelocityWindowFrames `
+        --acceleration-window-frames $AccelerationWindowFrames `
         --limit $Limit
 }
 elseif ($Mode -eq "batch-pins-v2") {
@@ -116,6 +126,8 @@ elseif ($Mode -eq "batch-pins-v2") {
         --mode pins-v2 `
         --frame-samples $FrameSamples `
         --max-frames $MaxFrames `
+        --velocity-window-frames $VelocityWindowFrames `
+        --acceleration-window-frames $AccelerationWindowFrames `
         --limit $Limit
 }
 elseif ($Mode -eq "batch-full") {
@@ -127,5 +139,7 @@ elseif ($Mode -eq "batch-full") {
         --mode full `
         --frame-samples $FrameSamples `
         --max-frames $MaxFrames `
+        --velocity-window-frames $VelocityWindowFrames `
+        --acceleration-window-frames $AccelerationWindowFrames `
         --limit $Limit
 }

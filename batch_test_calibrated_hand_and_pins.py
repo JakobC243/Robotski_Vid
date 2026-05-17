@@ -5,6 +5,9 @@ import traceback
 from pathlib import Path
 from typing import Dict, List
 
+# This batch runner intentionally reuses the single-video pipeline parser.
+# That keeps all calibration, hand tracking, and pin parameters consistent
+# between one-off tests and multi-video evaluation runs.
 from track_calibrated_hand_and_pins import (
     parse_args as parse_pipeline_args,
     process_calibration_only,
@@ -13,6 +16,8 @@ from track_calibrated_hand_and_pins import (
 
 
 def safe_case_name(input_root: Path, video_path: Path) -> str:
+    # Use the relative video path so files from different patients never
+    # overwrite each other even if the video names are similar.
     try:
         relative = video_path.relative_to(input_root)
     except ValueError:
@@ -27,6 +32,8 @@ def safe_case_name(input_root: Path, video_path: Path) -> str:
 
 
 def flatten_for_csv(row: Dict) -> Dict:
+    # CSV cells cannot store nested Python objects cleanly; JSON keeps the
+    # per-video diagnostics readable while preserving machine-parsable data.
     flat = dict(row)
     for key, value in list(flat.items()):
         if isinstance(value, (list, tuple, dict)):
@@ -35,6 +42,8 @@ def flatten_for_csv(row: Dict) -> Dict:
 
 
 def collect_videos(input_root: Path, pattern: str, limit: int) -> List[Path]:
+    # Sorting makes repeated batch runs deterministic, which is important when
+    # comparing threshold changes across the same subset of videos.
     videos = sorted(input_root.rglob(pattern))
     if limit > 0:
         videos = videos[:limit]
@@ -42,6 +51,8 @@ def collect_videos(input_root: Path, pattern: str, limit: int) -> List[Path]:
 
 
 def make_pipeline_args(batch_args: argparse.Namespace, video_path: Path, output_dir: Path) -> argparse.Namespace:
+    # Start from the main script defaults, then override only the values that
+    # the batch CLI exposes. This avoids a second, drifting configuration set.
     args = parse_pipeline_args([])
     args.video = str(video_path)
     args.output_root = str(output_dir)
@@ -59,6 +70,8 @@ def make_pipeline_args(batch_args: argparse.Namespace, video_path: Path, output_
         args.velocity_center_source = "ma"
         args.ma_window = 3
 
+    # Parameters below are forwarded directly to the underlying one-video
+    # pipeline so batch tests can tune calibration, speed, and occupancy logic.
     passthrough_names = [
         "frame_samples",
         "require_board",
@@ -81,7 +94,13 @@ def make_pipeline_args(batch_args: argparse.Namespace, video_path: Path, output_
         "center_mode",
         "min_detection_confidence",
         "min_tracking_confidence",
+        "velocity_window_frames",
+        "acceleration_window_frames",
         "occupancy_probability_threshold",
+        "occupancy_brightness_drop",
+        "occupancy_dark_fraction",
+        "occupancy_relative_dark_drop",
+        "occupancy_side_min_reference",
     ]
     for name in passthrough_names:
         setattr(args, name, getattr(batch_args, name))
@@ -90,6 +109,8 @@ def make_pipeline_args(batch_args: argparse.Namespace, video_path: Path, output_
 
 
 def write_batch_outputs(rows: List[Dict], output_root: Path) -> None:
+    # Rewriting the summary after every video gives a useful partial result if
+    # a long run is interrupted or a later case fails.
     output_root.mkdir(parents=True, exist_ok=True)
     json_path = output_root / "batch_summary.json"
     csv_path = output_root / "batch_summary.csv"
@@ -141,7 +162,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--center-mode", type=str, default="palm", choices=["palm", "bbox", "all"])
     parser.add_argument("--min-detection-confidence", type=float, default=0.45)
     parser.add_argument("--min-tracking-confidence", type=float, default=0.45)
+    parser.add_argument("--velocity-window-frames", type=int, default=3)
+    parser.add_argument("--acceleration-window-frames", type=int, default=5)
     parser.add_argument("--occupancy-probability-threshold", type=float, default=0.55)
+    parser.add_argument("--occupancy-brightness-drop", type=float, default=24.0)
+    parser.add_argument("--occupancy-dark-fraction", type=float, default=0.22)
+    parser.add_argument("--occupancy-relative-dark-drop", type=float, default=22.0)
+    parser.add_argument("--occupancy-side-min-reference", type=float, default=90.0)
     return parser.parse_args()
 
 
@@ -171,6 +198,8 @@ def main() -> None:
         }
 
         try:
+            # Failures are captured per video so one problematic recording does
+            # not hide results from the rest of the batch.
             pipeline_args = make_pipeline_args(batch_args, video_path, case_output)
             if batch_args.mode == "calibration":
                 summary = process_calibration_only(pipeline_args)

@@ -27,6 +27,19 @@ Point = Tuple[float, float]
 
 PALM_LANDMARKS = [0, 1, 5, 9, 13, 17]
 
+# Nastavljivi casovni parametri. Za mirnejso hitrost/pospesek povecaj okna,
+# za bolj odzivno meritev jih zmanjsaj.
+DEFAULT_HAND_CENTER_MA_WINDOW_FRAMES = 3
+DEFAULT_VELOCITY_WINDOW_FRAMES = 3
+DEFAULT_ACCELERATION_WINDOW_FRAMES = 5
+
+# Nastavitve za zaklep zasedenosti luknje. Zasedenost se potrdi sele po tem,
+# ko sta palec/kazalec obiskala luknjo, se umaknila, in je dokaz stabilen.
+DEFAULT_OCCUPANCY_INTERACTION_MEMORY_FRAMES = 24
+DEFAULT_OCCUPANCY_SETTLE_FRAMES = 3
+DEFAULT_OCCUPANCY_STABLE_OCCUPIED_FRAMES = 3
+DEFAULT_OCCUPANCY_STABLE_EMPTY_FRAMES = 3
+
 
 @dataclass
 class Hole:
@@ -1075,16 +1088,25 @@ class OccupancyStabilizer:
         interaction_alpha_scale: float = 0.20,
         interaction_memory_frames: int = 18,
         require_interaction_to_occupy: bool = True,
+        settle_frames: int = 3,
+        stable_occupied_frames: int = 3,
+        stable_empty_frames: int = 3,
     ):
         self.alpha = float(alpha)
         self.probabilities = np.zeros(hole_count, dtype=np.float32)
         self.states = np.zeros(hole_count, dtype=bool)
         self.recent_interactions = np.zeros(hole_count, dtype=np.int32)
+        self.settle_counters = np.zeros(hole_count, dtype=np.int32)
+        self.occupied_evidence = np.zeros(hole_count, dtype=np.int32)
+        self.empty_evidence = np.zeros(hole_count, dtype=np.int32)
         self.occupied_threshold = float(occupied_threshold)
         self.empty_threshold = float(empty_threshold)
         self.interaction_alpha_scale = float(interaction_alpha_scale)
         self.interaction_memory_frames = int(max(0, interaction_memory_frames))
         self.require_interaction_to_occupy = bool(require_interaction_to_occupy)
+        self.settle_frames = int(max(0, settle_frames))
+        self.stable_occupied_frames = int(max(1, stable_occupied_frames))
+        self.stable_empty_frames = int(max(1, stable_empty_frames))
 
     def update(self, raw_probs: Sequence[float], interaction_mask: Optional[Sequence[bool]] = None) -> np.ndarray:
         raw = np.asarray(raw_probs, dtype=np.float32)
@@ -1098,6 +1120,9 @@ class OccupancyStabilizer:
                     initial_can_occupy = np.zeros(raw.shape, dtype=bool)
             self.states = (raw >= self.occupied_threshold) & initial_can_occupy
             self.recent_interactions = np.zeros(raw.shape[0], dtype=np.int32)
+            self.settle_counters = np.zeros(raw.shape[0], dtype=np.int32)
+            self.occupied_evidence = np.zeros(raw.shape[0], dtype=np.int32)
+            self.empty_evidence = np.zeros(raw.shape[0], dtype=np.int32)
         else:
             if interaction_mask is None:
                 alpha = np.full(raw.shape, self.alpha, dtype=np.float32)
@@ -1130,10 +1155,38 @@ class OccupancyStabilizer:
         self.recent_interactions[interactions] = self.interaction_memory_frames
 
         for i, prob in enumerate(probabilities):
-            can_mark_occupied = (not self.require_interaction_to_occupy) or self.states[i] or self.recent_interactions[i] > 0
+            if interactions[i]:
+                self.settle_counters[i] = self.settle_frames
+                self.occupied_evidence[i] = 0
+                self.empty_evidence[i] = 0
+                continue
+
+            if self.settle_counters[i] > 0:
+                self.settle_counters[i] -= 1
+                self.occupied_evidence[i] = 0
+                self.empty_evidence[i] = 0
+                continue
+
+            can_mark_occupied = (
+                (not self.require_interaction_to_occupy)
+                or self.states[i]
+                or self.recent_interactions[i] > 0
+            )
+
             if prob >= self.occupied_threshold and can_mark_occupied:
+                self.occupied_evidence[i] += 1
+                self.empty_evidence[i] = 0
+            else:
+                self.occupied_evidence[i] = 0
+
+            if prob <= self.empty_threshold:
+                self.empty_evidence[i] += 1
+            else:
+                self.empty_evidence[i] = 0
+
+            if self.occupied_evidence[i] >= self.stable_occupied_frames:
                 self.states[i] = True
-            elif prob <= self.empty_threshold:
+            elif self.empty_evidence[i] >= self.stable_empty_frames:
                 self.states[i] = False
         return probabilities, [bool(v) for v in self.states]
 
@@ -1343,6 +1396,8 @@ def estimate_hole_occupancy(
     radius_multiplier: float,
     brightness_drop_threshold: float,
     dark_fraction_threshold: float,
+    relative_dark_threshold: float,
+    side_min_reference_value: float,
     hand_interaction_radius_px: float,
 ) -> Tuple[List[float], List[bool], List[Dict]]:
     if not holes:
@@ -1356,8 +1411,6 @@ def estimate_hole_occupancy(
     median_value = median_hsv[:, :, 2]
     diff = cv2.absdiff(gray, median_gray)
 
-    raw_probs = []
-    occupied = []
     features = []
     h, w = gray.shape[:2]
 
@@ -1390,21 +1443,9 @@ def estimate_hole_occupancy(
         finger_dist = hand_hole_interaction_distance(selected_hand, hole)
         interacting = bool(finger_dist <= max(hand_interaction_radius_px, 2.2 * radius))
 
-        drop_score = np.clip(brightness_drop / max(1e-6, brightness_drop_threshold), 0.0, 1.0)
-        ratio_score = np.clip((0.88 - brightness_ratio) / 0.28, 0.0, 1.0)
-        dark_fraction_score = np.clip(dark_fraction / max(1e-6, dark_fraction_threshold), 0.0, 1.0)
-        diff_score = np.clip(diff_fraction / max(1e-6, dark_fraction_threshold), 0.0, 1.0)
-
-        prob = 0.55 * float(drop_score)
-        prob += 0.20 * float(ratio_score)
-        prob += 0.20 * float(dark_fraction_score)
-        prob += 0.05 * float(diff_score)
-        prob += 0.10 if pin_near else 0.0
-        prob = float(np.clip(prob, 0.0, 1.0))
-        raw_probs.append(prob)
-        occupied.append(prob >= 0.55)
         features.append(
             {
+                "grid_id": int(hole.grid_id),
                 "baseline_value": float(baseline_mean),
                 "current_value": float(current_mean),
                 "brightness_drop": float(brightness_drop),
@@ -1416,6 +1457,43 @@ def estimate_hole_occupancy(
                 "hand_interaction": bool(interacting),
             }
         )
+
+    grid_reference: Dict[int, float] = {}
+    for grid_id in sorted({int(h.grid_id) for h in holes}):
+        values = [
+            feature["current_value"]
+            for feature in features
+            if int(feature["grid_id"]) == grid_id and np.isfinite(feature["current_value"])
+        ]
+        grid_reference[grid_id] = float(np.percentile(values, 75)) if values else 0.0
+
+    raw_probs = []
+    occupied = []
+    for feature in features:
+        side_reference = grid_reference.get(int(feature["grid_id"]), 0.0)
+        relative_dark_drop = float(side_reference - feature["current_value"])
+        relative_allowed = bool(side_reference >= side_min_reference_value)
+
+        drop_score = np.clip(feature["brightness_drop"] / max(1e-6, brightness_drop_threshold), 0.0, 1.0)
+        ratio_score = np.clip((0.88 - feature["brightness_ratio"]) / 0.28, 0.0, 1.0)
+        dark_fraction_score = np.clip(feature["dark_fraction"] / max(1e-6, dark_fraction_threshold), 0.0, 1.0)
+        diff_score = np.clip(feature["diff_fraction"] / max(1e-6, dark_fraction_threshold), 0.0, 1.0)
+        relative_score = np.clip(relative_dark_drop / max(1e-6, relative_dark_threshold), 0.0, 1.0) if relative_allowed else 0.0
+
+        prob = 0.30 * float(drop_score)
+        prob += 0.35 * float(relative_score)
+        prob += 0.15 * float(ratio_score)
+        prob += 0.15 * float(dark_fraction_score)
+        prob += 0.05 * float(diff_score)
+        prob += 0.05 if feature["pin_near"] else 0.0
+        prob = float(np.clip(prob, 0.0, 1.0))
+
+        feature["side_reference_value"] = float(side_reference)
+        feature["relative_dark_drop"] = float(relative_dark_drop)
+        feature["relative_dark_score"] = float(relative_score)
+        feature["occupancy_raw_probability"] = prob
+        raw_probs.append(prob)
+        occupied.append(prob >= 0.55)
 
     return raw_probs, occupied, features
 
@@ -1813,6 +1891,9 @@ def process_video(args: argparse.Namespace) -> Dict:
         interaction_alpha_scale=args.occupancy_interaction_alpha_scale,
         interaction_memory_frames=args.occupancy_interaction_memory_frames,
         require_interaction_to_occupy=not args.allow_occupancy_without_hand,
+        settle_frames=args.occupancy_settle_frames,
+        stable_occupied_frames=args.occupancy_stable_occupied_frames,
+        stable_empty_frames=args.occupancy_stable_empty_frames,
     )
 
     board_center = None
@@ -1826,9 +1907,14 @@ def process_video(args: argparse.Namespace) -> Dict:
     trajectory_px: List[Tuple[int, int]] = []
     prev_gray = None
     prev_velocity_center_mm: Optional[Tuple[float, float]] = None
-    prev_time: Optional[float] = None
-    prev_speed_ema = np.nan
+    prev_velocity_time: Optional[float] = None
+    prev_frame_time: Optional[float] = None
     speed_ema = np.nan
+    velocity_window_frames = max(1, int(args.velocity_window_frames))
+    acceleration_window_frames = max(1, int(args.acceleration_window_frames))
+    history_size = max(velocity_window_frames, acceleration_window_frames) + 8
+    velocity_history: Deque[Tuple[int, float, float, float]] = deque(maxlen=history_size)
+    speed_history: Deque[Tuple[int, float, float]] = deque(maxlen=history_size)
     cumulative_distance_mm = 0.0
     missing_frames = 0
     detected_frames = 0
@@ -1859,7 +1945,8 @@ def process_video(args: argparse.Namespace) -> Dict:
                 break
 
             time_s = frame_idx / fps
-            dt = 1.0 / fps if prev_time is None else max(1.0 / fps, time_s - prev_time)
+            dt = 1.0 / fps if prev_frame_time is None else max(1.0 / fps, time_s - prev_frame_time)
+            prev_frame_time = time_s
             predicted_center = kalman.predict(dt)
 
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -1930,29 +2017,50 @@ def process_video(args: argparse.Namespace) -> Dict:
                 velocity_center_mm = ma_mm
 
             if velocity_center is not None and np.isfinite(velocity_center_mm[0]) and np.isfinite(velocity_center_mm[1]):
-                if prev_velocity_center_mm is not None and prev_time is not None:
+                if prev_velocity_center_mm is not None and prev_velocity_time is not None:
                     segment_distance_mm = float(
                         np.hypot(
                             velocity_center_mm[0] - prev_velocity_center_mm[0],
                             velocity_center_mm[1] - prev_velocity_center_mm[1],
                         )
                     )
-                    candidate_speed = segment_distance_mm / max(1e-6, time_s - prev_time)
+                    segment_dt = max(1e-6, time_s - prev_velocity_time)
+                    segment_speed = segment_distance_mm / segment_dt
+                    if segment_speed <= args.max_hand_speed_mm_s:
+                        cumulative_distance_mm += segment_distance_mm
+                    else:
+                        segment_distance_mm = np.nan
+
+                velocity_history.append(
+                    (
+                        int(frame_idx),
+                        float(time_s),
+                        float(velocity_center_mm[0]),
+                        float(velocity_center_mm[1]),
+                    )
+                )
+
+                if len(velocity_history) > velocity_window_frames:
+                    old_frame, old_time, old_x, old_y = velocity_history[-(velocity_window_frames + 1)]
+                    window_dt = max(1e-6, time_s - old_time)
+                    window_distance = float(np.hypot(velocity_center_mm[0] - old_x, velocity_center_mm[1] - old_y))
+                    candidate_speed = window_distance / window_dt
                     if candidate_speed <= args.max_hand_speed_mm_s:
                         speed_mm_s = float(candidate_speed)
-                        cumulative_distance_mm += segment_distance_mm
                         if np.isnan(speed_ema):
                             speed_ema = speed_mm_s
                         else:
                             speed_ema = args.speed_ema_alpha * speed_mm_s + (1.0 - args.speed_ema_alpha) * speed_ema
-                        if not np.isnan(prev_speed_ema):
-                            acceleration_mm_s2 = float((speed_ema - prev_speed_ema) / max(1e-6, time_s - prev_time))
-                        prev_speed_ema = speed_ema
-                    else:
-                        segment_distance_mm = np.nan
-                        speed_mm_s = np.nan
+                        speed_history.append((int(frame_idx), float(time_s), float(speed_ema)))
+
+                        if len(speed_history) > acceleration_window_frames:
+                            _, old_speed_time, old_speed = speed_history[-(acceleration_window_frames + 1)]
+                            accel_dt = max(1e-6, time_s - old_speed_time)
+                            candidate_accel = float((speed_ema - old_speed) / accel_dt)
+                            if abs(candidate_accel) <= args.max_acceleration_mm_s2:
+                                acceleration_mm_s2 = candidate_accel
                 prev_velocity_center_mm = (float(velocity_center_mm[0]), float(velocity_center_mm[1]))
-                prev_time = time_s
+                prev_velocity_time = time_s
 
             if final_center is not None and np.isfinite(final_mm[0]) and np.isfinite(final_mm[1]):
                 trajectory_px.append((int(round(final_center[0])), int(round(final_center[1]))))
@@ -1983,9 +2091,14 @@ def process_video(args: argparse.Namespace) -> Dict:
                     radius_multiplier=args.occupancy_radius_multiplier,
                     brightness_drop_threshold=args.occupancy_brightness_drop,
                     dark_fraction_threshold=args.occupancy_dark_fraction,
+                    relative_dark_threshold=args.occupancy_relative_dark_drop,
+                    side_min_reference_value=args.occupancy_side_min_reference,
                     hand_interaction_radius_px=args.hand_hole_interaction_radius_px,
                 )
-                hole_interactions = [bool(item.get("hand_interaction", False)) for item in occ_features]
+                hole_interactions = [
+                    bool(item.get("hand_interaction", False) or item.get("pin_near", False))
+                    for item in occ_features
+                ]
                 if raw_occ_probs:
                     occ_probs, occupied = occupancy_filter.update_stateful(raw_occ_probs, interaction_mask=hole_interactions)
                 else:
@@ -2056,6 +2169,8 @@ def process_video(args: argparse.Namespace) -> Dict:
                 "ma_x_mm": float(ma_mm[0]),
                 "ma_y_mm": float(ma_mm[1]),
                 "velocity_center_source": str(args.velocity_center_source),
+                "velocity_window_frames": int(velocity_window_frames),
+                "acceleration_window_frames": int(acceleration_window_frames),
                 "velocity_x_mm": float(velocity_center_mm[0]),
                 "velocity_y_mm": float(velocity_center_mm[1]),
                 "segment_distance_mm": float(segment_distance_mm) if np.isfinite(segment_distance_mm) else np.nan,
@@ -2087,8 +2202,12 @@ def process_video(args: argparse.Namespace) -> Dict:
                     row[f"hole_{i:02d}_prob"] = prob
                     row[f"hole_{i:02d}_occupied"] = is_occupied
                     row[f"hole_{i:02d}_brightness_drop"] = float(feature.get("brightness_drop", np.nan))
+                    row[f"hole_{i:02d}_relative_dark_drop"] = float(feature.get("relative_dark_drop", np.nan))
+                    row[f"hole_{i:02d}_side_reference_value"] = float(feature.get("side_reference_value", np.nan))
                     row[f"hole_{i:02d}_dark_fraction"] = float(feature.get("dark_fraction", np.nan))
                     row[f"hole_{i:02d}_hand_interaction"] = int(bool(feature.get("hand_interaction", False)))
+                    row[f"hole_{i:02d}_pin_near"] = int(bool(feature.get("pin_near", False)))
+                    row[f"hole_{i:02d}_interaction_signal"] = int(bool(hole_interactions[i])) if i < len(hole_interactions) else 0
                     row[f"hole_{i:02d}_finger_distance_px"] = float(feature.get("finger_distance_px", np.nan))
 
             rows.append(row)
@@ -2130,6 +2249,8 @@ def process_video(args: argparse.Namespace) -> Dict:
         "task_duration_s": task_duration_s,
         "total_distance_mm": float(cumulative_distance_mm),
         "velocity_center_source": str(args.velocity_center_source),
+        "velocity_window_frames": int(velocity_window_frames),
+        "acceleration_window_frames": int(acceleration_window_frames),
         "pin_layer_enabled": bool(pin_layer_enabled),
         "mean_speed_mm_s": float(df["speed_ema_mm_s"].dropna().mean()) if not df["speed_ema_mm_s"].dropna().empty else np.nan,
         "max_speed_mm_s": float(df["speed_ema_mm_s"].dropna().max()) if not df["speed_ema_mm_s"].dropna().empty else np.nan,
@@ -2198,11 +2319,14 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--kalman-process-noise", type=float, default=0.04)
     parser.add_argument("--kalman-measurement-noise", type=float, default=8.0)
     parser.add_argument("--ema-alpha", type=float, default=0.45)
-    parser.add_argument("--ma-window", type=int, default=5)
+    parser.add_argument("--ma-window", type=int, default=DEFAULT_HAND_CENTER_MA_WINDOW_FRAMES)
     parser.add_argument("--velocity-center-source", type=str, default="ma", choices=["kalman", "ema", "ma"], help="Center used for speed and distance; hand overlay still uses Kalman.")
+    parser.add_argument("--velocity-window-frames", type=int, default=DEFAULT_VELOCITY_WINDOW_FRAMES, help="Frames used for speed calculation.")
+    parser.add_argument("--acceleration-window-frames", type=int, default=DEFAULT_ACCELERATION_WINDOW_FRAMES, help="Frames used for acceleration calculation.")
     parser.add_argument("--max-missing-frames", type=int, default=5)
     parser.add_argument("--max-jump-px", type=float, default=90.0)
     parser.add_argument("--max-hand-speed-mm-s", type=float, default=2500.0)
+    parser.add_argument("--max-acceleration-mm-s2", type=float, default=5000.0)
     parser.add_argument("--speed-ema-alpha", type=float, default=0.35)
     parser.add_argument("--max-trajectory-points", type=int, default=1200)
 
@@ -2217,10 +2341,15 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--occupancy-alpha", type=float, default=0.35)
     parser.add_argument("--occupancy-brightness-drop", type=float, default=24.0, help="Mean value drop that suggests a pin blocks the illuminated hole.")
     parser.add_argument("--occupancy-dark-fraction", type=float, default=0.22, help="Fraction of pixels that must darken inside a hole.")
+    parser.add_argument("--occupancy-relative-dark-drop", type=float, default=22.0, help="How much darker a hole must be than other holes on the same side grid.")
+    parser.add_argument("--occupancy-side-min-reference", type=float, default=90.0, help="Minimum same-side reference brightness before relative darkness is trusted.")
     parser.add_argument("--occupancy-probability-threshold", type=float, default=0.55)
     parser.add_argument("--occupancy-empty-threshold", type=float, default=0.35)
     parser.add_argument("--occupancy-interaction-alpha-scale", type=float, default=0.20, help="Lower update speed while thumb/index are above a hole.")
-    parser.add_argument("--occupancy-interaction-memory-frames", type=int, default=18, help="Frames after thumb/index interaction where a hole may change to occupied.")
+    parser.add_argument("--occupancy-interaction-memory-frames", type=int, default=DEFAULT_OCCUPANCY_INTERACTION_MEMORY_FRAMES, help="Frames after thumb/index interaction where a hole may change to occupied.")
+    parser.add_argument("--occupancy-settle-frames", type=int, default=DEFAULT_OCCUPANCY_SETTLE_FRAMES, help="Frames to ignore after thumb/index leave a hole.")
+    parser.add_argument("--occupancy-stable-occupied-frames", type=int, default=DEFAULT_OCCUPANCY_STABLE_OCCUPIED_FRAMES, help="Stable frames needed before a hole is marked occupied.")
+    parser.add_argument("--occupancy-stable-empty-frames", type=int, default=DEFAULT_OCCUPANCY_STABLE_EMPTY_FRAMES, help="Stable frames needed before a hole is marked empty.")
     parser.add_argument("--allow-occupancy-without-hand", action="store_true", help="Allow brightness-only occupancy changes without recent thumb/index interaction.")
     parser.add_argument("--hand-hole-interaction-radius-px", type=float, default=28.0)
 
