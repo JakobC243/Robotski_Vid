@@ -1,6 +1,7 @@
 import argparse
 import csv
 import json
+import re
 import traceback
 from pathlib import Path
 from typing import Dict, List
@@ -41,10 +42,27 @@ def flatten_for_csv(row: Dict) -> Dict:
     return flat
 
 
-def collect_videos(input_root: Path, pattern: str, limit: int) -> List[Path]:
+def patient_key(path: Path) -> str:
+    match = re.search(r"patient[_-]?(\d+)", str(path), flags=re.IGNORECASE)
+    if match is None:
+        match = re.search(r"pati\w*[_-]?(\d+)", str(path), flags=re.IGNORECASE)
+    return f"patient_{int(match.group(1)):03d}" if match else str(path.parent)
+
+
+def collect_videos(input_root: Path, pattern: str, limit: int, max_patients: int) -> List[Path]:
     # Sorting makes repeated batch runs deterministic, which is important when
     # comparing threshold changes across the same subset of videos.
     videos = sorted(input_root.rglob(pattern))
+    if max_patients > 0:
+        selected_patients = set()
+        selected_videos: List[Path] = []
+        for video in videos:
+            key = patient_key(video)
+            if key not in selected_patients and len(selected_patients) >= max_patients:
+                continue
+            selected_patients.add(key)
+            selected_videos.append(video)
+        videos = selected_videos
     if limit > 0:
         videos = videos[:limit]
     return videos
@@ -139,6 +157,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-root", type=str, default="outputs_batch_calibrated")
     parser.add_argument("--mode", choices=["calibration", "hand", "pins-v2", "full"], default="calibration")
     parser.add_argument("--limit", type=int, default=0, help="Limit number of videos. 0 means all matching videos.")
+    parser.add_argument("--max-patients", type=int, default=0, help="Limit number of patients. 0 means all patients.")
     parser.add_argument("--max-frames", type=int, default=0, help="Used only in full mode. 0 means full video.")
 
     parser.add_argument("--frame-samples", type=int, default=120)
@@ -176,7 +195,7 @@ def main() -> None:
     batch_args = parse_args()
     input_root = Path(batch_args.input_root)
     output_root = Path(batch_args.output_root)
-    videos = collect_videos(input_root, batch_args.pattern, batch_args.limit)
+    videos = collect_videos(input_root, batch_args.pattern, batch_args.limit, batch_args.max_patients)
 
     if not videos:
         raise FileNotFoundError(f"No videos found under {input_root} with pattern {batch_args.pattern}")
