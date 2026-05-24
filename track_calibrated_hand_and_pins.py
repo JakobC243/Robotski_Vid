@@ -2149,6 +2149,7 @@ def process_video(args: argparse.Namespace) -> Dict:
                 "frame": int(frame_idx),
                 "time_s": float(time_s),
                 "hand_status": hand_status,
+                "selected_handedness": selected_hand.handedness if selected_hand is not None else "",
                 "hand_detected": int(hand_detected and accepted_measurement is not None),
                 "hand_predicted": int(final_center is not None and accepted_measurement is None),
                 "measurement_rejected": int(measurement_rejected),
