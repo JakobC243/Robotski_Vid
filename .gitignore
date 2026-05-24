@@ -19,3 +19,6 @@ Thumbs.db
 *.avi
 *.mov
 *.zip
+
+!data/
+!data/**
