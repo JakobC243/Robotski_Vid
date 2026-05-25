@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections import deque
-from typing import Deque, Dict, Optional, Sequence, Tuple
+from typing import Deque, Dict, List, Optional, Sequence, Tuple, Union
 
 import cv2
 import numpy as np
@@ -12,6 +12,7 @@ from utils import moving_average_nan
 
 
 PANEL_WIDTH = 390
+ActivationRegion = Union[Tuple[int, int, int, int], np.ndarray]
 
 
 def draw_text(image: np.ndarray, text: str, org: Tuple[int, int], scale: float, color: Tuple[int, int, int]) -> None:
@@ -62,8 +63,17 @@ def draw_hand(image: np.ndarray, observation: HandObservation, smoothed_center: 
     )
 
 
-def draw_activation_roi(image: np.ndarray, activation_roi: Optional[Tuple[int, int, int, int]]) -> None:
+def draw_activation_roi(image: np.ndarray, activation_roi: Optional[ActivationRegion]) -> None:
     if activation_roi is None:
+        return
+    if isinstance(activation_roi, np.ndarray):
+        pts = np.round(np.asarray(activation_roi, dtype=np.float32).reshape(-1, 2)).astype(np.int32)
+        if pts.shape[0] < 3:
+            return
+        cv2.polylines(image, [pts], True, (255, 170, 60), 1, cv2.LINE_AA)
+        x = int(np.min(pts[:, 0]))
+        y = int(np.min(pts[:, 1]))
+        cv2.putText(image, "START ZONE", (x + 6, max(16, y - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (255, 170, 60), 1, cv2.LINE_AA)
         return
     x, y, w, h = activation_roi
     cv2.rectangle(image, (x, y), (x + w, y + h), (255, 170, 60), 1, cv2.LINE_AA)
@@ -74,18 +84,44 @@ def draw_trial_status(image: np.ndarray, trial_info) -> None:
     if trial_info is None:
         return
     started = bool(getattr(trial_info, "trial_started", False))
-    side = str(getattr(trial_info, "trial_side", ""))
     trial_time = float(getattr(trial_info, "trial_time_s", np.nan))
     state = str(getattr(trial_info, "state", ""))
     if started and np.isfinite(trial_time):
-        text = f"TRIAL {trial_time:5.2f}s"
-        if side:
-            text += f"  side={side}"
+        text = "CAS TECE"
         color = (80, 255, 130)
     else:
         text = f"WAIT LIGHT START  {state}"
         color = (0, 220, 255)
     draw_text(image, text, (15, 88), 0.52, color)
+
+
+def draw_field_regions(image: np.ndarray, field_regions: Sequence[Dict], hand_field_zone: str) -> None:
+    if not field_regions:
+        return
+    for region in field_regions:
+        side = str(region.get("side", ""))
+        polygon = np.asarray(region.get("polygon", []), dtype=np.float32).reshape(-1, 2)
+        if polygon.shape[0] < 3:
+            continue
+        pts = np.round(polygon).astype(np.int32)
+        active = side == hand_field_zone or hand_field_zone == "both"
+        color = (0, 255, 255) if active else (180, 180, 180)
+        thickness = 2 if active else 1
+        cv2.polylines(image, [pts], True, color, thickness, cv2.LINE_AA)
+        label = "LEVO" if side == "left" else "DESNO" if side == "right" else side.upper()
+        anchor = tuple(np.round(np.mean(polygon, axis=0)).astype(int))
+        cv2.putText(image, label, (anchor[0] - 18, anchor[1] + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.40, color, 1, cv2.LINE_AA)
+
+    if hand_field_zone:
+        if hand_field_zone == "left":
+            text = "ROKA LEVO"
+        elif hand_field_zone == "right":
+            text = "ROKA DESNO"
+        elif hand_field_zone == "both":
+            text = "ROKA OBE POLJI"
+        else:
+            text = f"ROKA {hand_field_zone.upper()}"
+        draw_text(image, text, (15, 118), 0.58, (0, 255, 255))
 
 
 def draw_trail(image: np.ndarray, trail: Sequence[Tuple[int, int]]) -> None:
@@ -163,13 +199,18 @@ def compose_frame(
     history: Dict[str, Deque[float]],
     fps: float,
     smooth_window: int,
-    activation_roi: Optional[Tuple[int, int, int, int]] = None,
+    activation_roi: Optional[ActivationRegion] = None,
     trial_info=None,
+    show_trial_status: bool = False,
+    field_regions: Optional[List[Dict]] = None,
+    hand_field_zone: str = "",
 ) -> np.ndarray:
     annotated = frame.copy()
     draw_calibration(annotated, calibration)
     draw_activation_roi(annotated, activation_roi)
-    draw_trial_status(annotated, trial_info)
+    if show_trial_status:
+        draw_trial_status(annotated, trial_info)
+    draw_field_regions(annotated, field_regions or [], hand_field_zone)
     draw_trail(annotated, trail)
     draw_hand(annotated, observation, smoothed_center)
     panel = np.zeros((annotated.shape[0], PANEL_WIDTH, 3), dtype=np.uint8)

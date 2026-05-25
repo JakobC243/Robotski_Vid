@@ -9,7 +9,7 @@ import cv2
 import numpy as np
 import pandas as pd
 
-from calibration import BoardCalibration, calibrate_frame, load_calibration, save_calibration
+from calibration import BoardCalibration, ImageRegion, calibrate_frame, load_calibration, save_calibration
 from hand_tracking import MediaPipeHandTracker
 from kinematics import KinematicsTracker
 from trial_timing import TrialLightStartDetector
@@ -34,16 +34,27 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--start-gate-scale", type=float, default=0.75, help="Relative size of the expanded center start zone inside the board ROI.")
     parser.add_argument("--start-gate-padding", type=float, default=0.15, help="Relative padding added around the hole-based center start zone used for initial hand lock.")
     parser.add_argument("--start-gate-hits", type=int, default=1, help="Consecutive frames in the start zone required before tracking starts.")
+    parser.add_argument("--tracking-roi-padding", type=float, default=0.08, help="Relative padding around the calibrated board ROI used to reject hand candidates after lock.")
+    parser.add_argument("--tracking-roi-mode", choices=["soft", "strict", "off"], default="soft", help="How the tracking ROI is used after hand lock: soft allows gradual exits, strict rejects every outside candidate, off ignores it.")
+    parser.add_argument("--tracking-roi-outside-frames", type=int, default=45, help="In soft ROI mode, maximum consecutive detected frames allowed outside the tracking ROI.")
+    parser.add_argument("--tracking-roi-exit-jump-px", type=float, default=120.0, help="In soft ROI mode, reject a first outside-ROI candidate if it jumps farther than this from the previous center.")
     parser.add_argument("--hand-lock-radius-px", type=float, default=120.0, help="After the active hand is locked, reject hand candidates farther than this many pixels from the previous center.")
     parser.add_argument("--hand-reacquire-radius-px", type=float, default=280.0, help="Maximum radius used when reacquiring the locked hand after missed frames.")
+    parser.add_argument("--max-missing-frames", type=int, default=10, help="After this many missed frames, clear the hand lock and wait for the start zone again.")
     parser.add_argument("--motion-weight", type=float, default=0.12, help="How strongly initial active-hand selection prefers the moving hand.")
     parser.add_argument("--min-start-motion-score", type=float, default=2.0, help="Minimum local motion score needed before a hand can start tracking.")
     parser.add_argument("--min-reacquire-motion-score", type=float, default=4.0, help="Minimum local motion score needed before a lost hand can be reacquired.")
     parser.add_argument("--reacquire-hits", type=int, default=2, help="Consecutive frames needed before a lost hand is accepted again.")
-    parser.add_argument("--trial-light-start", choices=["on", "off"], default="on", help="Detect trial start from board lights: both fields first, then one stable side.")
+    parser.add_argument("--trial-light-start", choices=["on", "off"], default="on", help="Detect trial start from board lights: both fields on, then off, then one stable side.")
+    parser.add_argument("--measure-from", choices=["trial-start", "immediate"], default="trial-start", help="Start kinematic stopwatch at detected trial start or immediately at video frame 0.")
+    parser.add_argument("--show-trial-status", action="store_true", help="Show light-start text such as WAIT LIGHT START / CAS TECE on the output video.")
+    parser.add_argument("--show-light-zones", action="store_true", help="Draw LED detector zones and point samples on the output video.")
+    parser.add_argument("--show-field-zones", action="store_true", help="Draw 3x3 hand-in-field diagnostic zones and ROKA LEVO/DESNO text on the output video.")
+    parser.add_argument("--field-roi-padding", type=float, default=0.75, help="Padding in hole-spacing units around each 3x3 pin field for the first hand-in-field diagnostic.")
     parser.add_argument("--light-delta-threshold", type=float, default=22.0, help="Brightness increase over baseline needed to mark a light field as on.")
     parser.add_argument("--light-side-gap-threshold", type=float, default=1.0, help="Minimum baseline-relative brightness gap between sides when deciding which single side is on.")
     parser.add_argument("--both-light-frames", type=int, default=3, help="Stable frames needed for the initial both-fields-on event.")
+    parser.add_argument("--off-light-frames", type=int, default=2, help="Stable frames with both light fields off required before one side can start trial time.")
     parser.add_argument("--single-light-frames", type=int, default=5, help="Stable frames needed before the single-side light starts trial time.")
     return parser.parse_args()
 
@@ -60,17 +71,77 @@ def board_point(calibration: BoardCalibration, point: Optional[Tuple[float, floa
     return calibration.image_to_board(point)
 
 
-def activation_roi_from_calibration(calibration: BoardCalibration, padding_ratio: float) -> Optional[Tuple[int, int, int, int]]:
+def activation_roi_from_calibration(calibration: BoardCalibration, padding_ratio: float) -> Optional[ImageRegion]:
     return calibration.start_zone_image_roi(padding_ratio=padding_ratio)
+
+
+def padded_board_roi(calibration: BoardCalibration, padding_ratio: float) -> Optional[Tuple[int, int, int, int]]:
+    if calibration.board_roi is None:
+        return None
+    x, y, w, h = calibration.board_roi
+    pad_x = float(w) * float(max(0.0, padding_ratio))
+    pad_y = float(h) * float(max(0.0, padding_ratio))
+    x1 = int(max(0, np.floor(float(x) - pad_x)))
+    y1 = int(max(0, np.floor(float(y) - pad_y)))
+    x2 = int(min(calibration.frame_width - 1, np.ceil(float(x + w) + pad_x)))
+    y2 = int(min(calibration.frame_height - 1, np.ceil(float(y + h) + pad_y)))
+    return x1, y1, max(1, x2 - x1), max(1, y2 - y1)
+
+
+def hand_field_contact(observation, field_regions: List[Dict]) -> Tuple[str, Dict[str, int]]:
+    counts = {"left": 0, "right": 0}
+    if not observation.detected or observation.landmarks_px is None:
+        return "", counts
+    points = np.asarray(observation.landmarks_px[:, :2], dtype=np.float32)
+    for region in field_regions:
+        side = str(region.get("side", ""))
+        if side not in counts:
+            continue
+        polygon = np.asarray(region.get("polygon", []), dtype=np.float32).reshape(-1, 2)
+        if polygon.shape[0] < 3:
+            continue
+        count = 0
+        for point in points:
+            if cv2.pointPolygonTest(polygon, (float(point[0]), float(point[1])), False) >= 0.0:
+                count += 1
+        counts[side] = max(counts[side], count)
+    if counts["left"] > 0 and counts["right"] > 0:
+        if counts["left"] == counts["right"]:
+            return "both", counts
+        return ("left" if counts["left"] > counts["right"] else "right"), counts
+    if counts["left"] > 0:
+        return "left", counts
+    if counts["right"] > 0:
+        return "right", counts
+    return "", counts
+
+
+def empty_kinematics_row(path_length: float = 0.0) -> Dict[str, float]:
+    return {
+        "hand_center_x": float("nan"),
+        "hand_center_y": float("nan"),
+        "path_length_px_cumulative": float(path_length),
+        "speed_px_s": float("nan"),
+        "speed_px_s_smooth": float("nan"),
+        "acceleration_px_s2": float("nan"),
+        "acceleration_px_s2_smooth": float("nan"),
+        "thumb_index_distance_px_smooth": float("nan"),
+        "speed_px_s_raw": float("nan"),
+        "acceleration_px_s2_raw": float("nan"),
+    }
 
 
 def build_row(
     frame_idx: int,
     time_s: float,
+    measurement_started: bool,
+    measurement_time_s: float,
     observation,
     kin: Dict[str, float],
     calibration: BoardCalibration,
     trial_info,
+    hand_field_zone: str,
+    hand_field_counts: Dict[str, int],
 ) -> Dict[str, object]:
     raw_center = observation.center_raw if observation.detected else None
     wrist = observation.wrist if observation.detected else None
@@ -89,6 +160,8 @@ def build_row(
     row = {
         "frame_idx": int(frame_idx),
         "time_s": float(time_s),
+        "measurement_started": int(measurement_started),
+        "measurement_time_s": float(measurement_time_s) if np.isfinite(measurement_time_s) else np.nan,
         "hand_detected": int(observation.detected),
         "track_started": int(observation.track_started),
         "waiting_for_start": int(observation.waiting_for_start),
@@ -96,6 +169,8 @@ def build_row(
         "hand_score": float(observation.hand_score) if observation.detected else np.nan,
         "hand_motion_score": float(observation.motion_score) if observation.detected else np.nan,
         "hand_missing_frames": int(observation.missing_frames),
+        "tracking_roi_inside": int(observation.tracking_roi_inside) if observation.detected else 0,
+        "tracking_roi_outside_frames": int(observation.tracking_roi_outside_frames) if observation.detected else 0,
         "hand_center_x_raw": float(raw_center[0]) if finite_point(raw_center) else np.nan,
         "hand_center_y_raw": float(raw_center[1]) if finite_point(raw_center) else np.nan,
         "hand_center_x": kin["hand_center_x"],
@@ -124,6 +199,9 @@ def build_row(
         "thumb_tip_board_y": thumb_board[1],
         "index_tip_board_x": index_board[0],
         "index_tip_board_y": index_board[1],
+        "hand_field_zone": hand_field_zone,
+        "hand_field_left_count": int(hand_field_counts.get("left", 0)),
+        "hand_field_right_count": int(hand_field_counts.get("right", 0)),
     }
     if trial_info is not None:
         row.update(trial_info.to_row())
@@ -209,6 +287,8 @@ def main() -> None:
         if calibration_output_path is not None:
             save_calibration(calibration, calibration_output_path)
     start_activation_roi = activation_roi_from_calibration(calibration, args.start_gate_padding)
+    tracking_roi = padded_board_roi(calibration, args.tracking_roi_padding)
+    field_regions = calibration.hole_grid_regions(padding_scale=args.field_roi_padding)
 
     writer = open_video_writer(output_path, fps, (frame_w + PANEL_WIDTH, frame_h))
     trial_detector = (
@@ -219,6 +299,7 @@ def main() -> None:
             light_delta_threshold=args.light_delta_threshold,
             side_gap_threshold=args.light_side_gap_threshold,
             both_stable_frames=args.both_light_frames,
+            off_stable_frames=args.off_light_frames,
             side_stable_frames=args.single_light_frames,
         )
         if args.trial_light_start == "on"
@@ -228,12 +309,16 @@ def main() -> None:
         start_gate_enabled=args.start_gate == "center",
         start_gate_scale=args.start_gate_scale,
         activation_consecutive_frames=args.start_gate_hits,
+        max_missing_frames=args.max_missing_frames,
         max_lock_jump_px=args.hand_lock_radius_px,
         max_reacquire_jump_px=args.hand_reacquire_radius_px,
         motion_weight=args.motion_weight,
         min_start_motion_score=args.min_start_motion_score,
         min_reacquire_motion_score=args.min_reacquire_motion_score,
         reacquire_consecutive_frames=args.reacquire_hits,
+        tracking_roi_mode=args.tracking_roi_mode,
+        max_tracking_roi_outside_frames=args.tracking_roi_outside_frames,
+        max_tracking_roi_exit_jump_px=args.tracking_roi_exit_jump_px,
     )
     kinematics = KinematicsTracker(args.smooth_alpha, args.smooth_window)
     trail: Deque[Tuple[int, int]] = deque(maxlen=max(1, int(args.trail_length)))
@@ -244,6 +329,8 @@ def main() -> None:
         "thumb_index": deque(maxlen=360),
     }
     rows: List[Dict[str, object]] = []
+    measurement_active = bool(args.measure_from == "immediate" or trial_detector is None)
+    measurement_start_frame = 0 if measurement_active else -1
     show_ok = bool(args.show)
     if show_ok:
         try:
@@ -264,21 +351,39 @@ def main() -> None:
             time_s = frame_idx / fps
             trial_info = trial_detector.update(frame_idx, frame) if trial_detector is not None else None
             activation_roi = tracker.get_activation_roi(frame.shape, calibration.board_roi, start_activation_roi)
-            observation = tracker.detect(frame, calibration.board_roi, start_activation_roi)
-            kin = kinematics.update(time_s, observation.detected, observation.center_raw, observation.thumb_index_distance_px)
+            observation = tracker.detect(frame, calibration.board_roi, start_activation_roi, tracking_roi)
+            hand_field_zone, hand_field_counts = hand_field_contact(observation, field_regions)
+            if not measurement_active and trial_info is not None and bool(getattr(trial_info, "trial_started", False)):
+                measurement_active = True
+                measurement_start_frame = int(frame_idx)
+                kinematics.reset()
+                trail.clear()
+                for values in history.values():
+                    values.clear()
+
+            measurement_time_s = (
+                max(0.0, (float(frame_idx) - float(measurement_start_frame)) / fps)
+                if measurement_active and measurement_start_frame >= 0
+                else float("nan")
+            )
+            if measurement_active:
+                kin = kinematics.update(measurement_time_s, observation.detected, observation.center_raw, observation.thumb_index_distance_px)
+            else:
+                kin = empty_kinematics_row()
             smoothed_center = None
-            if np.isfinite(kin["hand_center_x"]) and np.isfinite(kin["hand_center_y"]):
+            if measurement_active and np.isfinite(kin["hand_center_x"]) and np.isfinite(kin["hand_center_y"]):
                 smoothed_center = (float(kin["hand_center_x"]), float(kin["hand_center_y"]))
                 trail.append((int(round(smoothed_center[0])), int(round(smoothed_center[1]))))
 
-            history["path"].append(float(kin["path_length_px_cumulative"]))
-            history["speed"].append(float(kin["speed_px_s_smooth"]))
-            history["acceleration"].append(float(kin["acceleration_px_s2_smooth"]))
-            history["thumb_index"].append(float(kin["thumb_index_distance_px_smooth"]))
+            if measurement_active:
+                history["path"].append(float(kin["path_length_px_cumulative"]))
+                history["speed"].append(float(kin["speed_px_s_smooth"]))
+                history["acceleration"].append(float(kin["acceleration_px_s2_smooth"]))
+                history["thumb_index"].append(float(kin["thumb_index_distance_px_smooth"]))
 
-            rows.append(build_row(frame_idx, time_s, observation, kin, calibration, trial_info))
+            rows.append(build_row(frame_idx, time_s, measurement_active, measurement_time_s, observation, kin, calibration, trial_info, hand_field_zone, hand_field_counts))
             display_frame = frame.copy()
-            if trial_detector is not None and trial_info is not None:
+            if args.show_light_zones and trial_detector is not None and trial_info is not None:
                 trial_detector.draw_zones(display_frame, trial_info)
             composed = compose_frame(
                 display_frame,
@@ -291,6 +396,9 @@ def main() -> None:
                 args.smooth_window,
                 activation_roi=activation_roi,
                 trial_info=trial_info,
+                show_trial_status=args.show_trial_status,
+                field_regions=field_regions if args.show_field_zones else [],
+                hand_field_zone=hand_field_zone if args.show_field_zones else "",
             )
             writer.write(composed)
             if show_ok:

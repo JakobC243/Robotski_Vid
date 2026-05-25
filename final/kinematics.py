@@ -82,6 +82,10 @@ class KinematicsTracker:
         self.recent_accels.clear()
         self.recent_thumb_index.clear()
 
+    def reset(self) -> None:
+        self.reset_live_state()
+        self.path_length = 0.0
+
     def update(self, time_s: float, detected: bool, raw_center: Optional[Point], thumb_index_distance_px: float) -> Dict[str, float]:
         if not detected or not finite_point(raw_center):
             self.reset_live_state()

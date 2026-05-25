@@ -8,8 +8,10 @@ outputs*/
 data/
 
 .venv/
+.venv311/
 venv/
 env/
+final/.mplconfig/
 
 .DS_Store
 Thumbs.db

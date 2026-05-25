@@ -1,9 +1,14 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from pathlib import Path
+from typing import List, Optional, Tuple, Union
 
 import cv2
+
+os.environ.setdefault("MPLCONFIGDIR", str(Path(__file__).resolve().parent / ".mplconfig"))
+
 import mediapipe as mp
 import numpy as np
 
@@ -13,6 +18,8 @@ from utils import Point, distance
 WRIST = 0
 THUMB_TIP = 4
 INDEX_TIP = 8
+ActivationRegion = Union[Tuple[int, int, int, int], np.ndarray]
+DEFAULT_HAND_LANDMARKER_MODEL = Path(__file__).resolve().parent / "models" / "hand_landmarker.task"
 
 HAND_CONNECTIONS = [
     (0, 1), (1, 2), (2, 3), (3, 4),
@@ -38,6 +45,24 @@ class HandObservation:
     track_started: bool
     waiting_for_start: bool
     motion_score: float
+    tracking_roi_inside: bool
+    tracking_roi_outside_frames: int
+
+
+class _LandmarkListAdapter:
+    def __init__(self, landmarks) -> None:
+        self.landmark = landmarks
+
+
+class _HandednessAdapter:
+    def __init__(self, categories) -> None:
+        self.classification = categories
+
+
+class _HandResultAdapter:
+    def __init__(self, task_result) -> None:
+        self.multi_hand_landmarks = [_LandmarkListAdapter(item) for item in getattr(task_result, "hand_landmarks", [])]
+        self.multi_handedness = [_HandednessAdapter(item) for item in getattr(task_result, "handedness", [])]
 
 
 def empty_observation(missing_frames: int, track_started: bool = False, waiting_for_start: bool = False) -> HandObservation:
@@ -55,17 +80,20 @@ def empty_observation(missing_frames: int, track_started: bool = False, waiting_
         track_started=track_started,
         waiting_for_start=waiting_for_start,
         motion_score=float("nan"),
+        tracking_roi_inside=False,
+        tracking_roi_outside_frames=0,
     )
 
 
 def landmarks_to_pixels(hand_landmarks, width: int, height: int) -> np.ndarray:
     points = []
     for lm in hand_landmarks.landmark:
+        z = float(getattr(lm, "z", 0.0))
         points.append(
             [
                 float(np.clip(lm.x * width, 0, width - 1)),
                 float(np.clip(lm.y * height, 0, height - 1)),
-                float(lm.z),
+                z,
             ]
         )
     return np.asarray(points, dtype=np.float32)
@@ -97,12 +125,23 @@ def center_roi(frame_shape: Tuple[int, int, int], board_roi: Optional[Tuple[int,
     return roi_x, roi_y, roi_w, roi_h
 
 
-def point_in_roi(point: Point, roi: Tuple[int, int, int, int]) -> bool:
+def point_in_roi(point: Point, roi: ActivationRegion) -> bool:
+    if isinstance(roi, np.ndarray):
+        polygon = np.asarray(roi, dtype=np.float32).reshape(-1, 2)
+        if polygon.shape[0] < 3:
+            return False
+        return bool(cv2.pointPolygonTest(polygon, (float(point[0]), float(point[1])), False) >= 0.0)
     x, y, w, h = roi
     return bool(x <= point[0] <= x + w and y <= point[1] <= y + h)
 
 
-def roi_center(roi: Tuple[int, int, int, int]) -> Point:
+def roi_center(roi: ActivationRegion) -> Point:
+    if isinstance(roi, np.ndarray):
+        polygon = np.asarray(roi, dtype=np.float32).reshape(-1, 2)
+        if polygon.size == 0:
+            return float("nan"), float("nan")
+        center = np.mean(polygon, axis=0)
+        return float(center[0]), float(center[1])
     x, y, w, h = roi
     return float(x + w / 2.0), float(y + h / 2.0)
 
@@ -133,8 +172,14 @@ def select_active_hand(
     previous_center: Optional[Point],
     frame_shape: Tuple[int, int, int],
     board_roi: Optional[Tuple[int, int, int, int]],
-    activation_roi: Optional[Tuple[int, int, int, int]] = None,
+    activation_roi: Optional[ActivationRegion] = None,
+    tracking_roi: Optional[ActivationRegion] = None,
     require_activation_roi: bool = False,
+    require_tracking_roi: bool = False,
+    tracking_roi_mode: str = "soft",
+    tracking_roi_outside_frames: int = 0,
+    max_tracking_roi_outside_frames: int = 45,
+    max_tracking_roi_exit_jump_px: float = 120.0,
     max_lock_jump_px: float = 120.0,
     max_reacquire_jump_px: float = 280.0,
     lock_missing_frames: int = 0,
@@ -142,7 +187,7 @@ def select_active_hand(
     motion_weight: float = 0.12,
     min_start_motion_score: float = 0.0,
     min_reacquire_motion_score: float = 4.0,
-) -> Optional[Tuple[object, np.ndarray, str, float, float]]:
+) -> Optional[Tuple[object, np.ndarray, str, float, float, bool]]:
     if not result.multi_hand_landmarks:
         return None
     h, w = frame_shape[:2]
@@ -153,19 +198,33 @@ def select_active_hand(
     else:
         ref = reference_center(frame_shape, board_roi)
     handedness_list = result.multi_handedness or []
-    candidates: List[Tuple[float, float, object, np.ndarray, str, float, float]] = []
+    roi_mode = str(tracking_roi_mode or "soft").lower()
+    candidates: List[Tuple[float, float, object, np.ndarray, str, float, float, bool]] = []
     for idx, hand_landmarks in enumerate(result.multi_hand_landmarks):
         points = landmarks_to_pixels(hand_landmarks, w, h)
         center = center_from_landmarks(points)
         if require_activation_roi and activation_roi is not None and not point_in_roi(center, activation_roi):
             continue
+        inside_tracking_roi = bool(tracking_roi is None or point_in_roi(center, tracking_roi))
         label = "unknown"
         score = 0.0
         if idx < len(handedness_list) and handedness_list[idx].classification:
             cls = handedness_list[idx].classification[0]
-            label = str(cls.label).lower()
-            score = float(cls.score)
+            label_value = getattr(cls, "label", getattr(cls, "category_name", "unknown"))
+            label = str(label_value).lower()
+            score = float(getattr(cls, "score", 0.0))
         dist = distance(center, ref)
+        if require_tracking_roi and tracking_roi is not None and not inside_tracking_roi:
+            if roi_mode == "strict":
+                continue
+            if roi_mode == "soft" and previous_center is not None:
+                if int(tracking_roi_outside_frames) >= int(max_tracking_roi_outside_frames):
+                    continue
+                previous_inside = point_in_roi(previous_center, tracking_roi)
+                if previous_inside and np.isfinite(dist) and dist > float(max_tracking_roi_exit_jump_px):
+                    continue
+            elif roi_mode != "off":
+                continue
         motion_score = motion_score_for_hand(points, motion, w, h)
         if require_activation_roi and motion_score < min_start_motion_score:
             continue
@@ -188,12 +247,14 @@ def select_active_hand(
                 selection_score = -float(dist)
         else:
             selection_score = score + motion_weight * motion_score - 0.01 * (dist if np.isfinite(dist) else 0.0)
-        candidates.append((selection_score, float(dist) if np.isfinite(dist) else float("inf"), hand_landmarks, points, label, score, motion_score))
+        if roi_mode == "soft" and require_tracking_roi and tracking_roi is not None and not inside_tracking_roi:
+            selection_score -= 0.08 * (dist if np.isfinite(dist) else 0.0)
+        candidates.append((selection_score, float(dist) if np.isfinite(dist) else float("inf"), hand_landmarks, points, label, score, motion_score, inside_tracking_roi))
     if not candidates:
         return None
     candidates.sort(key=lambda item: item[0], reverse=True)
-    _, _, hand_landmarks, points, label, score, motion_score = candidates[0]
-    return hand_landmarks, points, label, score, motion_score
+    _, _, hand_landmarks, points, label, score, motion_score, inside_tracking_roi = candidates[0]
+    return hand_landmarks, points, label, score, motion_score, inside_tracking_roi
 
 
 class MediaPipeHandTracker:
@@ -213,15 +274,41 @@ class MediaPipeHandTracker:
         min_start_motion_score: float = 2.0,
         min_reacquire_motion_score: float = 4.0,
         reacquire_consecutive_frames: int = 2,
+        tracking_roi_mode: str = "soft",
+        max_tracking_roi_outside_frames: int = 45,
+        max_tracking_roi_exit_jump_px: float = 120.0,
     ):
-        self.mp_hands = mp.solutions.hands
-        self.hands = self.mp_hands.Hands(
-            static_image_mode=False,
-            max_num_hands=max_num_hands,
-            model_complexity=model_complexity,
-            min_detection_confidence=min_detection_confidence,
-            min_tracking_confidence=min_tracking_confidence,
-        )
+        if hasattr(mp, "solutions"):
+            self.backend = "solutions"
+            self.mp_hands = mp.solutions.hands
+            self.hands = self.mp_hands.Hands(
+                static_image_mode=False,
+                max_num_hands=max_num_hands,
+                model_complexity=model_complexity,
+                min_detection_confidence=min_detection_confidence,
+                min_tracking_confidence=min_tracking_confidence,
+            )
+        else:
+            if not DEFAULT_HAND_LANDMARKER_MODEL.exists():
+                raise FileNotFoundError(
+                    "MediaPipe Tasks requires a hand landmarker model. "
+                    f"Expected: {DEFAULT_HAND_LANDMARKER_MODEL}"
+                )
+            from mediapipe.tasks.python import vision
+            from mediapipe.tasks.python.core.base_options import BaseOptions
+
+            self.backend = "tasks"
+            self.running_mode = vision.RunningMode.VIDEO
+            options = vision.HandLandmarkerOptions(
+                base_options=BaseOptions(model_asset_path=str(DEFAULT_HAND_LANDMARKER_MODEL)),
+                running_mode=self.running_mode,
+                num_hands=max_num_hands,
+                min_hand_detection_confidence=min_detection_confidence,
+                min_hand_presence_confidence=min_detection_confidence,
+                min_tracking_confidence=min_tracking_confidence,
+            )
+            self.hands = vision.HandLandmarker.create_from_options(options)
+            self.timestamp_ms = 0
         self.previous_center: Optional[Point] = None
         self.missing_frames = 0
         self.max_missing_frames = int(max_missing_frames)
@@ -234,11 +321,26 @@ class MediaPipeHandTracker:
         self.min_start_motion_score = float(max(0.0, min_start_motion_score))
         self.min_reacquire_motion_score = float(max(0.0, min_reacquire_motion_score))
         self.reacquire_consecutive_frames = int(max(1, reacquire_consecutive_frames))
+        self.tracking_roi_mode = str(tracking_roi_mode or "soft").lower()
+        if self.tracking_roi_mode not in {"strict", "soft", "off"}:
+            self.tracking_roi_mode = "soft"
+        self.max_tracking_roi_outside_frames = int(max(0, max_tracking_roi_outside_frames))
+        self.max_tracking_roi_exit_jump_px = float(max(1.0, max_tracking_roi_exit_jump_px))
+        self.tracking_roi_outside_frames = 0
         self.track_started = not self.start_gate_enabled
         self.start_gate_hits = 0
         self.reacquire_hits = 0
         self.reacquire_candidate_center: Optional[Point] = None
         self.prev_gray: Optional[np.ndarray] = None
+
+    def reset_lock(self) -> None:
+        self.previous_center = None
+        self.missing_frames = 0
+        self.start_gate_hits = 0
+        self.reacquire_hits = 0
+        self.reacquire_candidate_center = None
+        self.tracking_roi_outside_frames = 0
+        self.track_started = not self.start_gate_enabled
 
     def close(self) -> None:
         self.hands.close()
@@ -247,8 +349,8 @@ class MediaPipeHandTracker:
         self,
         frame_shape: Tuple[int, int, int],
         board_roi: Optional[Tuple[int, int, int, int]],
-        activation_roi_override: Optional[Tuple[int, int, int, int]] = None,
-    ) -> Optional[Tuple[int, int, int, int]]:
+        activation_roi_override: Optional[ActivationRegion] = None,
+    ) -> Optional[ActivationRegion]:
         if not self.start_gate_enabled or self.track_started:
             return None
         if activation_roi_override is not None:
@@ -259,13 +361,19 @@ class MediaPipeHandTracker:
         self,
         frame_bgr: np.ndarray,
         board_roi: Optional[Tuple[int, int, int, int]],
-        activation_roi_override: Optional[Tuple[int, int, int, int]] = None,
+        activation_roi_override: Optional[ActivationRegion] = None,
+        tracking_roi_override: Optional[ActivationRegion] = None,
     ) -> HandObservation:
         gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
         motion = None if self.prev_gray is None else cv2.absdiff(gray, self.prev_gray)
         rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
         rgb.flags.writeable = False
-        result = self.hands.process(rgb)
+        if self.backend == "tasks":
+            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+            result = _HandResultAdapter(self.hands.detect_for_video(mp_image, self.timestamp_ms))
+            self.timestamp_ms += 1
+        else:
+            result = self.hands.process(rgb)
 
         activation_roi = self.get_activation_roi(frame_bgr.shape, board_roi, activation_roi_override)
         waiting_for_start = bool(self.start_gate_enabled and not self.track_started)
@@ -275,7 +383,13 @@ class MediaPipeHandTracker:
             frame_bgr.shape,
             board_roi,
             activation_roi=activation_roi,
+            tracking_roi=tracking_roi_override,
             require_activation_roi=waiting_for_start,
+            require_tracking_roi=bool(self.track_started and tracking_roi_override is not None),
+            tracking_roi_mode=self.tracking_roi_mode,
+            tracking_roi_outside_frames=self.tracking_roi_outside_frames,
+            max_tracking_roi_outside_frames=self.max_tracking_roi_outside_frames,
+            max_tracking_roi_exit_jump_px=self.max_tracking_roi_exit_jump_px,
             max_lock_jump_px=self.max_lock_jump_px,
             max_reacquire_jump_px=self.max_reacquire_jump_px,
             lock_missing_frames=self.missing_frames if self.track_started else 0,
@@ -292,6 +406,9 @@ class MediaPipeHandTracker:
             self.missing_frames += 1
             self.reacquire_hits = 0
             self.reacquire_candidate_center = None
+            if self.start_gate_enabled and self.missing_frames >= self.max_missing_frames:
+                self.reset_lock()
+                return empty_observation(0, track_started=False, waiting_for_start=True)
             return empty_observation(self.missing_frames, track_started=self.track_started, waiting_for_start=False)
 
         if waiting_for_start:
@@ -300,7 +417,7 @@ class MediaPipeHandTracker:
                 return empty_observation(0, track_started=False, waiting_for_start=True)
             self.track_started = True
 
-        _, points, label, score, motion_score = selected
+        _, points, label, score, motion_score, inside_tracking_roi = selected
         center = center_from_landmarks(points)
         if self.missing_frames > 0 and self.reacquire_consecutive_frames > 1:
             if self.reacquire_candidate_center is not None and distance(center, self.reacquire_candidate_center) <= self.max_lock_jump_px:
@@ -313,6 +430,10 @@ class MediaPipeHandTracker:
 
         self.previous_center = center
         self.missing_frames = 0
+        if self.track_started and tracking_roi_override is not None and not inside_tracking_roi:
+            self.tracking_roi_outside_frames += 1
+        else:
+            self.tracking_roi_outside_frames = 0
         self.reacquire_hits = 0
         self.reacquire_candidate_center = None
         wrist = (float(points[WRIST, 0]), float(points[WRIST, 1]))
@@ -332,4 +453,6 @@ class MediaPipeHandTracker:
             track_started=self.track_started,
             waiting_for_start=False,
             motion_score=float(motion_score),
+            tracking_roi_inside=bool(inside_tracking_roi),
+            tracking_roi_outside_frames=int(self.tracking_roi_outside_frames),
         )

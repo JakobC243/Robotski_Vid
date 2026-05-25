@@ -6,7 +6,7 @@ from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 
 import cv2
 import numpy as np
@@ -15,6 +15,7 @@ from utils import Point, ensure_parent, finite_point
 
 
 BOARD_COORD_MARGIN = 0.0
+ImageRegion = Union[Tuple[int, int, int, int], np.ndarray]
 
 
 def order_corners(points: np.ndarray) -> np.ndarray:
@@ -55,6 +56,88 @@ def clip_roi_from_points(points: np.ndarray, frame_width: int, frame_height: int
     x_max = int(min(frame_width - 1, np.ceil(float(np.max(pts[:, 0])) + margin)))
     y_max = int(min(frame_height - 1, np.ceil(float(np.max(pts[:, 1])) + margin)))
     return x_min, y_min, max(1, x_max - x_min), max(1, y_max - y_min)
+
+
+def start_region_from_hole_grids(
+    grids: List[Dict],
+    frame_width: int,
+    frame_height: int,
+    padding_ratio: float,
+) -> Optional[np.ndarray]:
+    valid_grids = []
+    for grid in grids:
+        points = np.asarray(grid.get("expected_points", []), dtype=np.float32).reshape(-1, 2)
+        if points.shape[0] >= 9 and np.all(np.isfinite(points)):
+            valid_grids.append((grid, points))
+    if len(valid_grids) < 2:
+        return None
+
+    selected = valid_grids[:2]
+    pts_by_grid = [points for _, points in selected]
+    centers = np.asarray([np.mean(points, axis=0) for points in pts_by_grid], dtype=np.float32)
+    center_delta = centers[1] - centers[0]
+    center_distance = float(np.linalg.norm(center_delta))
+
+    spacings = []
+    for grid, _ in selected:
+        for key in ("spacing_u_px", "spacing_v_px"):
+            value = float(grid.get(key, 0.0))
+            if np.isfinite(value) and value > 0.0:
+                spacings.append(value)
+    spacing = float(np.median(spacings)) if spacings else max(16.0, center_distance / 8.0)
+    if center_distance <= max(1.0, 0.5 * spacing):
+        return None
+
+    along = (center_delta / center_distance).astype(np.float32)
+    across = np.asarray([-along[1], along[0]], dtype=np.float32)
+    all_points = np.vstack(pts_by_grid).astype(np.float32)
+    along_proj = all_points @ along
+    across_proj = all_points @ across
+    along_span = float(np.ptp(along_proj))
+    across_span = float(np.ptp(across_proj))
+    padding = float(max(0.0, padding_ratio))
+
+    along_pad = max(0.60 * spacing, padding * max(spacing, along_span))
+    across_pad = max(0.85 * spacing, padding * max(spacing, across_span))
+    along_pad = min(along_pad, max(2.20 * spacing, 0.25 * along_span))
+    across_pad = min(across_pad, max(1.60 * spacing, 0.50 * across_span))
+
+    along_min = float(np.min(along_proj) - along_pad)
+    along_max = float(np.max(along_proj) + along_pad)
+    across_min = float(np.min(across_proj) - across_pad)
+    across_max = float(np.max(across_proj) + across_pad)
+
+    polygon = np.asarray(
+        [
+            along_min * along + across_min * across,
+            along_max * along + across_min * across,
+            along_max * along + across_max * across,
+            along_min * along + across_max * across,
+        ],
+        dtype=np.float32,
+    )
+    polygon[:, 0] = np.clip(polygon[:, 0], 0, frame_width - 1)
+    polygon[:, 1] = np.clip(polygon[:, 1], 0, frame_height - 1)
+    return polygon
+
+
+def hole_grid_region_from_points(points: np.ndarray, spacing: float, padding_scale: float) -> Optional[np.ndarray]:
+    pts = np.asarray(points, dtype=np.float32).reshape(-1, 2)
+    if pts.shape[0] < 4 or not np.all(np.isfinite(pts)):
+        return None
+    rect = cv2.minAreaRect(pts)
+    box = cv2.boxPoints(rect).astype(np.float32)
+    center = np.mean(box, axis=0)
+    pad = max(2.0, float(spacing) * float(max(0.0, padding_scale)))
+    expanded = []
+    for point in box:
+        direction = point - center
+        norm = float(np.linalg.norm(direction))
+        if norm <= 1e-6:
+            expanded.append(point)
+        else:
+            expanded.append(point + direction / norm * pad)
+    return order_corners(np.asarray(expanded, dtype=np.float32))
 
 
 @dataclass
@@ -430,48 +513,55 @@ class BoardCalibration:
         y_max = int(min(self.frame_height - 1, np.ceil(np.max(image_poly[:, 1]))))
         return x_min, y_min, max(1, x_max - x_min), max(1, y_max - y_min)
 
-    def start_zone_image_roi(self, padding_ratio: float = 0.30) -> Optional[Tuple[int, int, int, int]]:
+    def start_zone_image_roi(self, padding_ratio: float = 0.30) -> Optional[ImageRegion]:
         if len(self.hole_grids) >= 2:
-            grids = [grid for grid in self.hole_grids if np.asarray(grid.get("expected_points", [])).size >= 18]
-            if len(grids) >= 2:
-                grids = grids[:2]
-                pts_by_grid = [np.asarray(grid["expected_points"], dtype=np.float32).reshape(-1, 2) for grid in grids]
-                centers = [np.mean(pts, axis=0) for pts in pts_by_grid]
-                delta = np.abs(centers[1] - centers[0])
-                axis = int(np.argmax(delta))
-                perp = 1 - axis
-                order = np.argsort([center[axis] for center in centers])
-                first = pts_by_grid[int(order[0])]
-                second = pts_by_grid[int(order[1])]
-                all_points = np.vstack(pts_by_grid)
-                spacings = []
-                for grid in grids:
-                    spacings.extend([float(grid.get("spacing_u_px", 0.0)), float(grid.get("spacing_v_px", 0.0))])
-                spacing = float(np.median([s for s in spacings if np.isfinite(s) and s > 0.0])) if spacings else 24.0
-
-                inner_lo = float(np.max(first[:, axis]) - 0.45 * spacing)
-                inner_hi = float(np.min(second[:, axis]) + 0.45 * spacing)
-                if inner_hi <= inner_lo:
-                    middle = 0.5 * float(centers[0][axis] + centers[1][axis])
-                    inner_lo = middle - 1.15 * spacing
-                    inner_hi = middle + 1.15 * spacing
-                axis_pad = max(0.35 * spacing, padding_ratio * max(spacing, inner_hi - inner_lo))
-                perp_pad = max(1.15 * spacing, 0.5 * padding_ratio * max(spacing, float(np.ptp(all_points[:, perp]))))
-
-                rect_min = np.zeros(2, dtype=np.float32)
-                rect_max = np.zeros(2, dtype=np.float32)
-                rect_min[axis] = inner_lo - axis_pad
-                rect_max[axis] = inner_hi + axis_pad
-                rect_min[perp] = float(np.min(all_points[:, perp]) - perp_pad)
-                rect_max[perp] = float(np.max(all_points[:, perp]) + perp_pad)
-                rect_min[0] = np.clip(rect_min[0], 0, self.frame_width - 1)
-                rect_max[0] = np.clip(rect_max[0], 0, self.frame_width - 1)
-                rect_min[1] = np.clip(rect_min[1], 0, self.frame_height - 1)
-                rect_max[1] = np.clip(rect_max[1], 0, self.frame_height - 1)
-                x1, y1 = rect_min
-                x2, y2 = rect_max
-                return int(x1), int(y1), max(1, int(round(x2 - x1))), max(1, int(round(y2 - y1)))
+            region = start_region_from_hole_grids(
+                self.hole_grids,
+                frame_width=self.frame_width,
+                frame_height=self.frame_height,
+                padding_ratio=padding_ratio,
+            )
+            if region is not None:
+                return region
         return self.zone_image_roi("center_zone", padding_ratio=padding_ratio)
+
+    def hole_grid_regions(self, padding_scale: float = 0.75) -> List[Dict]:
+        regions = []
+        for grid in self.hole_grids:
+            points = np.asarray(grid.get("expected_points", []), dtype=np.float32).reshape(-1, 2)
+            if points.shape[0] < 9:
+                continue
+            spacings = [
+                float(grid.get("spacing_u_px", 0.0)),
+                float(grid.get("spacing_v_px", 0.0)),
+            ]
+            valid_spacings = [value for value in spacings if np.isfinite(value) and value > 0.0]
+            spacing = float(np.median(valid_spacings)) if valid_spacings else 20.0
+            polygon = hole_grid_region_from_points(points, spacing, padding_scale)
+            if polygon is None:
+                continue
+            polygon[:, 0] = np.clip(polygon[:, 0], 0, self.frame_width - 1)
+            polygon[:, 1] = np.clip(polygon[:, 1], 0, self.frame_height - 1)
+            center = np.mean(polygon, axis=0)
+            regions.append(
+                {
+                    "grid_id": int(grid.get("grid_id", len(regions))),
+                    "side": "",
+                    "polygon": polygon.astype(np.float32),
+                    "center": center.astype(np.float32),
+                }
+            )
+        regions.sort(key=lambda item: (float(item["center"][0]), float(item["center"][1])))
+        for idx, region in enumerate(regions):
+            if len(regions) == 1:
+                region["side"] = "unknown"
+            elif idx == 0:
+                region["side"] = "left"
+            elif idx == len(regions) - 1:
+                region["side"] = "right"
+            else:
+                region["side"] = f"grid_{idx}"
+        return regions
 
     def to_dict(self) -> Dict:
         return {
