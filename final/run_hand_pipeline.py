@@ -32,7 +32,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--trail-length", type=int, default=200, help="Number of smoothed hand center points shown as trajectory.")
     parser.add_argument("--start-gate", choices=["center", "none"], default="center", help="Wait until a hand enters the center board zone before locking the active hand.")
     parser.add_argument("--start-gate-scale", type=float, default=0.75, help="Relative size of the expanded center start zone inside the board ROI.")
-    parser.add_argument("--start-gate-padding", type=float, default=0.15, help="Relative padding added around the calibrated center board zone used for initial hand lock.")
+    parser.add_argument("--start-gate-padding", type=float, default=0.15, help="Relative padding added around the hole-based center start zone used for initial hand lock.")
     parser.add_argument("--start-gate-hits", type=int, default=1, help="Consecutive frames in the start zone required before tracking starts.")
     parser.add_argument("--hand-lock-radius-px", type=float, default=120.0, help="After the active hand is locked, reject hand candidates farther than this many pixels from the previous center.")
     parser.add_argument("--hand-reacquire-radius-px", type=float, default=280.0, help="Maximum radius used when reacquiring the locked hand after missed frames.")
@@ -61,7 +61,7 @@ def board_point(calibration: BoardCalibration, point: Optional[Tuple[float, floa
 
 
 def activation_roi_from_calibration(calibration: BoardCalibration, padding_ratio: float) -> Optional[Tuple[int, int, int, int]]:
-    return calibration.zone_image_roi("center_zone", padding_ratio=padding_ratio)
+    return calibration.start_zone_image_roi(padding_ratio=padding_ratio)
 
 
 def build_row(

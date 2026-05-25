@@ -39,6 +39,10 @@ uporablja lokalno gibanje roke, blizino zadnje zaklenjene pozicije in recovery
 pravila. Ko je roka enkrat zaklenjena, kandidat na drugi strani slike ne sme
 kar prevzeti sledi; ce prava roka za nekaj frame-ov izgine, video raje pokaze
 `NO HAND DETECTED`.
+Zacetni pravokotnik se najprej izracuna iz zaznanih 3x3 mrez lukenj. Ce sta
+obe mrezi najdeni, je start cona omejena na prostor med njima z zmernim
+paddingom; zato ne sme vec pokriti skoraj cele slike. Na videu so izrisane tudi
+luknje, iz katerih je bila narejena kalibracija.
 Ce zelis to izklopiti:
 
 ```powershell
@@ -110,9 +114,12 @@ Za uporabo ze shranjene kalibracije:
 
 ## Kalibracija
 
-Skripta najprej poskusi avtomatsko najti plosco s kombinacijo sivinske slike,
-CLAHE, Gaussian blur, Canny robov, kontur in geometrijskih pogojev. Ce avtomatika
-odpove, odpre rocni fallback, kjer kliknes 4 vogale plosce.
+Skripta najprej poskusi najti dve 3x3 mrezi lukenj na plosci. Iz teh lukenj
+izpelje obmocje plosce, shrani luknje v JSON in jih narise na video. Ce lukenj
+ne najde dovolj stabilno, poskusi se staro avtomatsko iskanje roba plosce s
+kombinacijo sivinske slike, CLAHE, Gaussian blur, Canny robov, kontur in
+geometrijskih pogojev. Ce tudi to odpove, odpre rocni fallback, kjer kliknes 4
+vogale plosce.
 
 Pomembno: ce uporabljas `--rotate-clockwise`, se kalibracija, MediaPipe, CSV in
 izris vsi izvajajo v koordinatah zarotiranega videa.

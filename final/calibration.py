@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import json
+import math
+from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -46,6 +48,323 @@ def roi_from_corners(corners: np.ndarray, frame_width: int, frame_height: int) -
     return x_min, y_min, max(1, x_max - x_min), max(1, y_max - y_min)
 
 
+def clip_roi_from_points(points: np.ndarray, frame_width: int, frame_height: int, margin: float) -> Tuple[int, int, int, int]:
+    pts = np.asarray(points, dtype=np.float32).reshape(-1, 2)
+    x_min = int(max(0, np.floor(float(np.min(pts[:, 0])) - margin)))
+    y_min = int(max(0, np.floor(float(np.min(pts[:, 1])) - margin)))
+    x_max = int(min(frame_width - 1, np.ceil(float(np.max(pts[:, 0])) + margin)))
+    y_max = int(min(frame_height - 1, np.ceil(float(np.max(pts[:, 1])) + margin)))
+    return x_min, y_min, max(1, x_max - x_min), max(1, y_max - y_min)
+
+
+@dataclass
+class CalibrationHole:
+    hole_id: int
+    grid_id: int
+    local_id: int
+    row: int
+    col: int
+    x_px: float
+    y_px: float
+    r_px: float
+    matched: bool
+
+    def to_dict(self) -> Dict:
+        return {
+            "hole_id": int(self.hole_id),
+            "grid_id": int(self.grid_id),
+            "local_id": int(self.local_id),
+            "row": int(self.row),
+            "col": int(self.col),
+            "x_px": float(self.x_px),
+            "y_px": float(self.y_px),
+            "r_px": float(self.r_px),
+            "matched": bool(self.matched),
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict) -> "CalibrationHole":
+        return cls(
+            hole_id=int(data.get("hole_id", 0)),
+            grid_id=int(data.get("grid_id", 0)),
+            local_id=int(data.get("local_id", 0)),
+            row=int(data.get("row", 0)),
+            col=int(data.get("col", 0)),
+            x_px=float(data.get("x_px", float("nan"))),
+            y_px=float(data.get("y_px", float("nan"))),
+            r_px=float(data.get("r_px", 4.0)),
+            matched=bool(data.get("matched", False)),
+        )
+
+
+def merge_close_points(points: List[Dict], merge_dist_px: float) -> List[Dict]:
+    merged: List[Dict] = []
+    for point in points:
+        found = False
+        for existing in merged:
+            dist = float(np.hypot(point["x"] - existing["x"], point["y"] - existing["y"]))
+            if dist <= merge_dist_px:
+                existing["x"] = 0.5 * (existing["x"] + point["x"])
+                existing["y"] = 0.5 * (existing["y"] + point["y"])
+                existing["r"] = max(existing["r"], point["r"])
+                existing["area"] = max(existing["area"], point["area"])
+                existing["score"] = max(existing["score"], point["score"])
+                found = True
+                break
+        if not found:
+            merged.append(dict(point))
+    return merged
+
+
+def detect_bright_hole_candidates(
+    image_bgr: np.ndarray,
+    gray_threshold: int = 170,
+    value_threshold: int = 180,
+    min_radius: float = 2.8,
+    max_radius: float = 9.0,
+    min_area: float = 15.0,
+    max_area: float = 130.0,
+    min_circularity: float = 0.25,
+) -> Tuple[List[Dict], np.ndarray]:
+    gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+    hsv = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2HSV)
+    value = hsv[:, :, 2]
+    mask = np.where((gray >= gray_threshold) | (value >= value_threshold), 255, 0).astype(np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((2, 2), np.uint8), iterations=1)
+
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    points: List[Dict] = []
+    for contour in contours:
+        area = float(cv2.contourArea(contour))
+        if area < min_area or area > max_area:
+            continue
+        perimeter = float(cv2.arcLength(contour, True))
+        if perimeter <= 0:
+            continue
+        circularity = float(4.0 * math.pi * area / (perimeter * perimeter))
+        if circularity < min_circularity:
+            continue
+        (x, y), radius = cv2.minEnclosingCircle(contour)
+        if radius < min_radius or radius > max_radius:
+            continue
+        local_mask = np.zeros(gray.shape, dtype=np.uint8)
+        cv2.drawContours(local_mask, [contour], -1, 255, -1)
+        mean_value = float(cv2.mean(value, mask=local_mask)[0])
+        points.append(
+            {
+                "x": float(x),
+                "y": float(y),
+                "r": float(radius),
+                "area": area,
+                "circularity": circularity,
+                "mean_value": mean_value,
+                "score": mean_value * circularity * area,
+            }
+        )
+    points = merge_close_points(points, merge_dist_px=max(3.5, 1.2 * min_radius))
+    points.sort(key=lambda item: (item["y"], item["x"]))
+    return points, mask
+
+
+def cluster_hole_candidates(points: List[Dict], link_distance_px: float = 45.0) -> List[List[int]]:
+    if not points:
+        return []
+    coords = np.asarray([[p["x"], p["y"]] for p in points], dtype=np.float32)
+    visited = np.zeros(len(points), dtype=bool)
+    clusters: List[List[int]] = []
+    for start in range(len(points)):
+        if visited[start]:
+            continue
+        queue: deque[int] = deque([start])
+        visited[start] = True
+        cluster = []
+        while queue:
+            idx = queue.popleft()
+            cluster.append(idx)
+            dists = np.linalg.norm(coords - coords[idx].reshape(1, 2), axis=1)
+            for neighbor in np.where((dists <= link_distance_px) & (~visited))[0]:
+                visited[int(neighbor)] = True
+                queue.append(int(neighbor))
+        clusters.append(cluster)
+    clusters.sort(key=len, reverse=True)
+    return clusters
+
+
+def nearest_unused(expected: np.ndarray, points: np.ndarray, used: set, tolerance_px: float) -> Tuple[Optional[int], float]:
+    dists = np.linalg.norm(points - expected.reshape(1, 2), axis=1)
+    for idx in np.argsort(dists):
+        idx = int(idx)
+        if idx in used:
+            continue
+        dist = float(dists[idx])
+        if dist <= tolerance_px:
+            return idx, dist
+        return None, float("inf")
+    return None, float("inf")
+
+
+def score_hole_grid(points: np.ndarray, p0: np.ndarray, u: np.ndarray, v: np.ndarray, min_matches: int) -> Optional[Dict]:
+    spacing_u = float(np.linalg.norm(u))
+    spacing_v = float(np.linalg.norm(v))
+    if spacing_u <= 1e-6 or spacing_v <= 1e-6:
+        return None
+    spacing_ratio = max(spacing_u, spacing_v) / max(1e-6, min(spacing_u, spacing_v))
+    if spacing_ratio > 1.75:
+        return None
+    cos_angle = abs(float(np.dot(u, v) / (spacing_u * spacing_v)))
+    if cos_angle > 0.70:
+        return None
+
+    tolerance_px = max(6.0, 0.32 * 0.5 * (spacing_u + spacing_v))
+    expected_points = []
+    matched_points = []
+    matched_indices = []
+    errors = []
+    used = set()
+    for row in range(3):
+        for col in range(3):
+            expected = p0 + col * u + row * v
+            expected_points.append(expected)
+            idx, err = nearest_unused(expected, points, used, tolerance_px)
+            if idx is None:
+                continue
+            used.add(idx)
+            matched_indices.append(idx)
+            matched_points.append(points[idx])
+            errors.append(err)
+
+    matches = len(matched_indices)
+    if matches < min_matches:
+        return None
+    mean_error = float(np.mean(errors)) if errors else float("inf")
+    score = matches * 1000.0 - mean_error * 60.0 - abs(spacing_u - spacing_v) * 6.0 - cos_angle * 160.0
+    return {
+        "score": float(score),
+        "matches": int(matches),
+        "mean_error_px": mean_error,
+        "spacing_u_px": spacing_u,
+        "spacing_v_px": spacing_v,
+        "cos_angle": cos_angle,
+        "p0": p0.astype(np.float32),
+        "u": u.astype(np.float32),
+        "v": v.astype(np.float32),
+        "expected_points": np.asarray(expected_points, dtype=np.float32),
+        "matched_points": np.asarray(matched_points, dtype=np.float32),
+        "matched_indices": matched_indices,
+    }
+
+
+def fit_best_hole_grid(cluster_points: np.ndarray, min_spacing_px: float, max_spacing_px: float, min_matches: int) -> Optional[Dict]:
+    if len(cluster_points) < min_matches:
+        return None
+    best = None
+    n = len(cluster_points)
+    for i in range(n):
+        p0 = cluster_points[i]
+        for j in range(n):
+            if j == i:
+                continue
+            u = cluster_points[j] - p0
+            du = float(np.linalg.norm(u))
+            if du < min_spacing_px or du > max_spacing_px:
+                continue
+            for k in range(n):
+                if k == i or k == j:
+                    continue
+                v = cluster_points[k] - p0
+                dv = float(np.linalg.norm(v))
+                if dv < min_spacing_px or dv > max_spacing_px:
+                    continue
+                candidate = score_hole_grid(cluster_points, p0, u, v, min_matches=min_matches)
+                if candidate is not None and (best is None or candidate["score"] > best["score"]):
+                    best = candidate
+    return best
+
+
+def select_two_hole_grids(
+    points: List[Dict],
+    clusters: List[List[int]],
+    min_spacing_px: float = 16.0,
+    max_spacing_px: float = 44.0,
+    min_matches: int = 7,
+    min_grid_separation_px: float = 90.0,
+) -> List[Dict]:
+    grids = []
+    all_points = np.asarray([[p["x"], p["y"]] for p in points], dtype=np.float32)
+    for cluster_id, cluster in enumerate(clusters):
+        if len(cluster) < min_matches:
+            continue
+        grid = fit_best_hole_grid(
+            cluster_points=all_points[cluster],
+            min_spacing_px=min_spacing_px,
+            max_spacing_px=max_spacing_px,
+            min_matches=min_matches,
+        )
+        if grid is None:
+            continue
+        grid["cluster_id"] = int(cluster_id)
+        grid["cluster_size"] = int(len(cluster))
+        center = np.mean(grid["expected_points"], axis=0)
+        grid["center"] = np.asarray(center, dtype=np.float32)
+        grid["point_indices"] = [int(cluster[i]) for i in grid["matched_indices"]]
+        grids.append(grid)
+
+    grids.sort(key=lambda item: item["score"], reverse=True)
+    selected = []
+    for grid in grids:
+        center = np.asarray(grid["center"], dtype=np.float32)
+        if any(float(np.linalg.norm(center - np.asarray(other["center"], dtype=np.float32))) < min_grid_separation_px for other in selected):
+            continue
+        selected.append(grid)
+        if len(selected) == 2:
+            break
+    selected.sort(key=lambda item: (float(item["center"][0]), float(item["center"][1])))
+    return selected
+
+
+def grid_json_safe(grid: Dict) -> Dict:
+    return {
+        "grid_id": int(grid.get("grid_id", 0)),
+        "cluster_id": int(grid.get("cluster_id", -1)),
+        "cluster_size": int(grid.get("cluster_size", 0)),
+        "matches": int(grid.get("matches", grid.get("num_matches", 0))),
+        "mean_error_px": float(grid.get("mean_error_px", float("nan"))),
+        "spacing_u_px": float(grid.get("spacing_u_px", float("nan"))),
+        "spacing_v_px": float(grid.get("spacing_v_px", float("nan"))),
+        "cos_angle": float(grid.get("cos_angle", float("nan"))),
+        "center": np.asarray(grid.get("center", [float("nan"), float("nan")]), dtype=float).tolist(),
+        "p0": np.asarray(grid.get("p0", [float("nan"), float("nan")]), dtype=float).tolist(),
+        "u": np.asarray(grid.get("u", [float("nan"), float("nan")]), dtype=float).tolist(),
+        "v": np.asarray(grid.get("v", [float("nan"), float("nan")]), dtype=float).tolist(),
+        "expected_points": np.asarray(grid.get("expected_points", []), dtype=float).reshape(-1, 2).tolist(),
+        "point_indices": [int(i) for i in grid.get("point_indices", [])],
+    }
+
+
+def grid_from_json(data: Dict) -> Dict:
+    out = dict(data)
+    for key in ("center", "p0", "u", "v"):
+        if key in out:
+            out[key] = np.asarray(out[key], dtype=np.float32)
+    if "expected_points" in out:
+        out["expected_points"] = np.asarray(out["expected_points"], dtype=np.float32).reshape(-1, 2)
+    return out
+
+
+def derive_quad_from_hole_grids(grids: List[Dict], width: int, height: int) -> Optional[np.ndarray]:
+    if not grids:
+        return None
+    points = np.vstack([grid["expected_points"] for grid in grids]).astype(np.float32)
+    spacings = []
+    for grid in grids:
+        spacings.extend([float(grid["spacing_u_px"]), float(grid["spacing_v_px"])])
+    spacing = float(np.median(spacings)) if spacings else 20.0
+    margin = max(22.0, 1.7 * spacing)
+    roi = clip_roi_from_points(points, width, height, margin)
+    x, y, w, h = roi
+    return np.asarray([[x, y], [x + w, y], [x + w, y + h], [x, y + h]], dtype=np.float32)
+
+
 @dataclass
 class BoardCalibration:
     frame_width: int
@@ -57,6 +376,9 @@ class BoardCalibration:
     board_width: float
     board_height: float
     zones: Dict[str, Tuple[float, float, float, float]]
+    holes: List[CalibrationHole]
+    hole_grids: List[Dict]
+    hole_candidate_count: int
     status: str
     source: str
     created_at: str
@@ -108,6 +430,49 @@ class BoardCalibration:
         y_max = int(min(self.frame_height - 1, np.ceil(np.max(image_poly[:, 1]))))
         return x_min, y_min, max(1, x_max - x_min), max(1, y_max - y_min)
 
+    def start_zone_image_roi(self, padding_ratio: float = 0.30) -> Optional[Tuple[int, int, int, int]]:
+        if len(self.hole_grids) >= 2:
+            grids = [grid for grid in self.hole_grids if np.asarray(grid.get("expected_points", [])).size >= 18]
+            if len(grids) >= 2:
+                grids = grids[:2]
+                pts_by_grid = [np.asarray(grid["expected_points"], dtype=np.float32).reshape(-1, 2) for grid in grids]
+                centers = [np.mean(pts, axis=0) for pts in pts_by_grid]
+                delta = np.abs(centers[1] - centers[0])
+                axis = int(np.argmax(delta))
+                perp = 1 - axis
+                order = np.argsort([center[axis] for center in centers])
+                first = pts_by_grid[int(order[0])]
+                second = pts_by_grid[int(order[1])]
+                all_points = np.vstack(pts_by_grid)
+                spacings = []
+                for grid in grids:
+                    spacings.extend([float(grid.get("spacing_u_px", 0.0)), float(grid.get("spacing_v_px", 0.0))])
+                spacing = float(np.median([s for s in spacings if np.isfinite(s) and s > 0.0])) if spacings else 24.0
+
+                inner_lo = float(np.max(first[:, axis]) - 0.45 * spacing)
+                inner_hi = float(np.min(second[:, axis]) + 0.45 * spacing)
+                if inner_hi <= inner_lo:
+                    middle = 0.5 * float(centers[0][axis] + centers[1][axis])
+                    inner_lo = middle - 1.15 * spacing
+                    inner_hi = middle + 1.15 * spacing
+                axis_pad = max(0.35 * spacing, padding_ratio * max(spacing, inner_hi - inner_lo))
+                perp_pad = max(1.15 * spacing, 0.5 * padding_ratio * max(spacing, float(np.ptp(all_points[:, perp]))))
+
+                rect_min = np.zeros(2, dtype=np.float32)
+                rect_max = np.zeros(2, dtype=np.float32)
+                rect_min[axis] = inner_lo - axis_pad
+                rect_max[axis] = inner_hi + axis_pad
+                rect_min[perp] = float(np.min(all_points[:, perp]) - perp_pad)
+                rect_max[perp] = float(np.max(all_points[:, perp]) + perp_pad)
+                rect_min[0] = np.clip(rect_min[0], 0, self.frame_width - 1)
+                rect_max[0] = np.clip(rect_max[0], 0, self.frame_width - 1)
+                rect_min[1] = np.clip(rect_min[1], 0, self.frame_height - 1)
+                rect_max[1] = np.clip(rect_max[1], 0, self.frame_height - 1)
+                x1, y1 = rect_min
+                x2, y2 = rect_max
+                return int(x1), int(y1), max(1, int(round(x2 - x1))), max(1, int(round(y2 - y1)))
+        return self.zone_image_roi("center_zone", padding_ratio=padding_ratio)
+
     def to_dict(self) -> Dict:
         return {
             "frame_width": int(self.frame_width),
@@ -119,6 +484,9 @@ class BoardCalibration:
             "board_width": float(self.board_width),
             "board_height": float(self.board_height),
             "zones": {key: list(value) for key, value in self.zones.items()},
+            "holes": [hole.to_dict() for hole in self.holes],
+            "hole_grids": [grid_json_safe(grid) for grid in self.hole_grids],
+            "hole_candidate_count": int(self.hole_candidate_count),
             "status": self.status,
             "source": self.source,
             "created_at": self.created_at,
@@ -137,6 +505,9 @@ class BoardCalibration:
             board_width=float(data.get("board_width", 0.0)),
             board_height=float(data.get("board_height", 0.0)),
             zones={key: tuple(float(v) for v in value) for key, value in data.get("zones", {}).items()},
+            holes=[CalibrationHole.from_dict(item) for item in data.get("holes", [])],
+            hole_grids=[grid_from_json(item) for item in data.get("hole_grids", [])],
+            hole_candidate_count=int(data.get("hole_candidate_count", 0)),
             status=str(data.get("status", "unknown")),
             source=str(data.get("source", "json")),
             created_at=str(data.get("created_at", "")),
@@ -156,6 +527,9 @@ def empty_calibration(frame: np.ndarray, status: str, source: str, video: str = 
         board_width=0.0,
         board_height=0.0,
         zones={},
+        holes=[],
+        hole_grids=[],
+        hole_candidate_count=0,
         status=status,
         source=source,
         created_at=datetime.now().isoformat(timespec="seconds"),
@@ -195,11 +569,81 @@ def build_calibration_from_corners(frame: np.ndarray, corners: np.ndarray, sourc
         board_width=float(board_w),
         board_height=float(board_h),
         zones=zones,
+        holes=[],
+        hole_grids=[],
+        hole_candidate_count=0,
         status="calibrated",
         source=source,
         created_at=datetime.now().isoformat(timespec="seconds"),
         video=video,
     )
+
+
+def build_calibration_from_hole_grids(frame: np.ndarray, video: str = "") -> Optional[BoardCalibration]:
+    h, w = frame.shape[:2]
+    side_points, _ = detect_bright_hole_candidates(frame)
+    clusters = cluster_hole_candidates(side_points, link_distance_px=45.0)
+    grids = select_two_hole_grids(
+        side_points,
+        clusters,
+        min_spacing_px=16.0,
+        max_spacing_px=44.0,
+        min_matches=7,
+        min_grid_separation_px=90.0,
+    )
+    if len(grids) < 2:
+        return None
+
+    quad = derive_quad_from_hole_grids(grids, width=w, height=h)
+    if quad is None:
+        return None
+    calibration = build_calibration_from_corners(frame, quad, source="hole_grid", video=video)
+
+    holes: List[CalibrationHole] = []
+    hole_id = 0
+    for grid_id, grid in enumerate(grids):
+        grid["grid_id"] = int(grid_id)
+        point_indices = [int(idx) for idx in grid.get("point_indices", [])]
+        source_radii = [
+            float(side_points[idx]["r"])
+            for idx in point_indices
+            if 0 <= int(idx) < len(side_points)
+        ]
+        default_radius = float(np.median(source_radii)) if source_radii else 5.0
+        matched_indices = set(point_indices)
+        for local_id, point in enumerate(np.asarray(grid["expected_points"], dtype=np.float32).reshape(-1, 2)):
+            row = int(local_id // 3)
+            col = int(local_id % 3)
+            radius = default_radius
+            matched = False
+            if side_points:
+                candidate_centers = np.asarray([[p["x"], p["y"]] for p in side_points], dtype=np.float32)
+                dists = np.linalg.norm(candidate_centers - point.reshape(1, 2), axis=1)
+                nearest_idx = int(np.argmin(dists))
+                if nearest_idx in matched_indices or float(dists[nearest_idx]) <= max(7.0, 0.35 * default_radius + 5.0):
+                    matched = True
+                    radius = float(side_points[nearest_idx]["r"])
+            holes.append(
+                CalibrationHole(
+                    hole_id=hole_id,
+                    grid_id=int(grid_id),
+                    local_id=int(local_id),
+                    row=row,
+                    col=col,
+                    x_px=float(point[0]),
+                    y_px=float(point[1]),
+                    r_px=float(radius),
+                    matched=matched,
+                )
+            )
+            hole_id += 1
+
+    calibration.holes = holes
+    calibration.hole_grids = grids
+    calibration.hole_candidate_count = len(side_points)
+    calibration.source = "hole_grid"
+    calibration.status = "calibrated"
+    return calibration
 
 
 def auto_detect_board_corners(frame: np.ndarray) -> Optional[np.ndarray]:
@@ -290,6 +734,9 @@ def manual_select_corners(frame: np.ndarray) -> Optional[np.ndarray]:
 
 
 def calibrate_frame(frame: np.ndarray, video: str = "", allow_manual: bool = True) -> BoardCalibration:
+    hole_calibration = build_calibration_from_hole_grids(frame, video=video)
+    if hole_calibration is not None:
+        return hole_calibration
     corners = auto_detect_board_corners(frame)
     if corners is not None:
         return build_calibration_from_corners(frame, corners, source="auto_contour", video=video)
@@ -327,5 +774,44 @@ def draw_calibration(frame: np.ndarray, calibration: BoardCalibration) -> None:
             y_axis = tuple(np.round(image_axes[2]).astype(int))
             cv2.arrowedLine(frame, origin, x_axis, (0, 80, 255), 2, cv2.LINE_AA, tipLength=0.25)
             cv2.arrowedLine(frame, origin, y_axis, (80, 255, 80), 2, cv2.LINE_AA, tipLength=0.25)
+        for grid in calibration.hole_grids:
+            pts = np.asarray(grid.get("expected_points", []), dtype=np.float32).reshape(-1, 2)
+            if pts.shape[0] != 9:
+                continue
+            color = (60, 255, 120) if int(grid.get("grid_id", 0)) == 0 else (255, 180, 60)
+            for row in range(3):
+                p1 = tuple(np.round(pts[row * 3]).astype(int))
+                p2 = tuple(np.round(pts[row * 3 + 2]).astype(int))
+                cv2.line(frame, p1, p2, color, 1, cv2.LINE_AA)
+            for col in range(3):
+                p1 = tuple(np.round(pts[col]).astype(int))
+                p2 = tuple(np.round(pts[6 + col]).astype(int))
+                cv2.line(frame, p1, p2, color, 1, cv2.LINE_AA)
+        for hole in calibration.holes:
+            center = (int(round(hole.x_px)), int(round(hole.y_px)))
+            color = (60, 255, 120) if hole.matched else (0, 190, 255)
+            cv2.circle(frame, center, int(round(max(4.0, hole.r_px))), color, 1, cv2.LINE_AA)
+            cv2.circle(frame, center, 2, (0, 60, 255), -1, cv2.LINE_AA)
+            cv2.putText(
+                frame,
+                f"{hole.grid_id}.{hole.local_id}",
+                (center[0] + 4, center[1] - 4),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.32,
+                color,
+                1,
+                cv2.LINE_AA,
+            )
+        if calibration.holes:
+            cv2.putText(
+                frame,
+                f"HOLES {len(calibration.holes)} candidates={calibration.hole_candidate_count}",
+                (15, 50),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.48,
+                (60, 255, 120),
+                1,
+                cv2.LINE_AA,
+            )
     else:
         cv2.putText(frame, "NO CALIBRATION", (15, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 180, 255), 2, cv2.LINE_AA)
