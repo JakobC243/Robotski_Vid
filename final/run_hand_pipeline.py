@@ -1,0 +1,313 @@
+from __future__ import annotations
+
+import argparse
+from collections import deque
+from pathlib import Path
+from typing import Deque, Dict, List, Optional, Tuple
+
+import cv2
+import numpy as np
+import pandas as pd
+
+from calibration import BoardCalibration, calibrate_frame, load_calibration, save_calibration
+from hand_tracking import MediaPipeHandTracker
+from kinematics import KinematicsTracker
+from trial_timing import TrialLightStartDetector
+from utils import ensure_parent, finite_point, open_video_writer, rotate_if_needed
+from visualization import PANEL_WIDTH, compose_frame
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Clean final 9HPT hand tracking pipeline: calibration, MediaPipe hand, kinematics, video graphs, CSV.")
+    parser.add_argument("--input", required=True, help="Input video.")
+    parser.add_argument("--output", required=True, help="Output video with overlays.")
+    parser.add_argument("--csv-output", required=True, help="CSV output with frame-level measurements.")
+    parser.add_argument("--calibration-output", default=None, help="Calibration JSON output.")
+    parser.add_argument("--calibration-input", default=None, help="Optional existing calibration JSON.")
+    parser.add_argument("--rotate-clockwise", action="store_true", help="Rotate each frame 90 degrees clockwise before all processing.")
+    parser.add_argument("--show", action="store_true", help="Show OpenCV preview while processing.")
+    parser.add_argument("--max-frames", type=int, default=0, help="Optional frame limit for testing. 0 means full video.")
+    parser.add_argument("--smooth-window", type=int, default=7, help="Moving average window for graph values.")
+    parser.add_argument("--smooth-alpha", type=float, default=0.35, help="EMA alpha for live coordinate and metric smoothing.")
+    parser.add_argument("--trail-length", type=int, default=200, help="Number of smoothed hand center points shown as trajectory.")
+    parser.add_argument("--start-gate", choices=["center", "none"], default="center", help="Wait until a hand enters the center board zone before locking the active hand.")
+    parser.add_argument("--start-gate-scale", type=float, default=0.75, help="Relative size of the expanded center start zone inside the board ROI.")
+    parser.add_argument("--start-gate-padding", type=float, default=0.15, help="Relative padding added around the calibrated center board zone used for initial hand lock.")
+    parser.add_argument("--start-gate-hits", type=int, default=1, help="Consecutive frames in the start zone required before tracking starts.")
+    parser.add_argument("--hand-lock-radius-px", type=float, default=120.0, help="After the active hand is locked, reject hand candidates farther than this many pixels from the previous center.")
+    parser.add_argument("--hand-reacquire-radius-px", type=float, default=280.0, help="Maximum radius used when reacquiring the locked hand after missed frames.")
+    parser.add_argument("--motion-weight", type=float, default=0.12, help="How strongly initial active-hand selection prefers the moving hand.")
+    parser.add_argument("--min-start-motion-score", type=float, default=2.0, help="Minimum local motion score needed before a hand can start tracking.")
+    parser.add_argument("--min-reacquire-motion-score", type=float, default=4.0, help="Minimum local motion score needed before a lost hand can be reacquired.")
+    parser.add_argument("--reacquire-hits", type=int, default=2, help="Consecutive frames needed before a lost hand is accepted again.")
+    parser.add_argument("--trial-light-start", choices=["on", "off"], default="on", help="Detect trial start from board lights: both fields first, then one stable side.")
+    parser.add_argument("--light-delta-threshold", type=float, default=22.0, help="Brightness increase over baseline needed to mark a light field as on.")
+    parser.add_argument("--light-side-gap-threshold", type=float, default=1.0, help="Minimum baseline-relative brightness gap between sides when deciding which single side is on.")
+    parser.add_argument("--both-light-frames", type=int, default=3, help="Stable frames needed for the initial both-fields-on event.")
+    parser.add_argument("--single-light-frames", type=int, default=5, help="Stable frames needed before the single-side light starts trial time.")
+    return parser.parse_args()
+
+
+def first_processed_frame(cap: cv2.VideoCapture, rotate_clockwise: bool) -> np.ndarray:
+    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+    ok, frame = cap.read()
+    if not ok:
+        raise RuntimeError("Could not read first frame from input video.")
+    return rotate_if_needed(frame, rotate_clockwise)
+
+
+def board_point(calibration: BoardCalibration, point: Optional[Tuple[float, float]]) -> Tuple[float, float]:
+    return calibration.image_to_board(point)
+
+
+def activation_roi_from_calibration(calibration: BoardCalibration, padding_ratio: float) -> Optional[Tuple[int, int, int, int]]:
+    return calibration.zone_image_roi("center_zone", padding_ratio=padding_ratio)
+
+
+def build_row(
+    frame_idx: int,
+    time_s: float,
+    observation,
+    kin: Dict[str, float],
+    calibration: BoardCalibration,
+    trial_info,
+) -> Dict[str, object]:
+    raw_center = observation.center_raw if observation.detected else None
+    wrist = observation.wrist if observation.detected else None
+    thumb = observation.thumb_tip if observation.detected else None
+    index = observation.index_tip if observation.detected else None
+    smoothed_center = (
+        float(kin["hand_center_x"]),
+        float(kin["hand_center_y"]),
+    ) if np.isfinite(kin["hand_center_x"]) and np.isfinite(kin["hand_center_y"]) else None
+
+    center_board = board_point(calibration, smoothed_center)
+    wrist_board = board_point(calibration, wrist)
+    thumb_board = board_point(calibration, thumb)
+    index_board = board_point(calibration, index)
+
+    row = {
+        "frame_idx": int(frame_idx),
+        "time_s": float(time_s),
+        "hand_detected": int(observation.detected),
+        "track_started": int(observation.track_started),
+        "waiting_for_start": int(observation.waiting_for_start),
+        "active_hand_label": observation.active_hand_label if observation.detected else "",
+        "hand_score": float(observation.hand_score) if observation.detected else np.nan,
+        "hand_motion_score": float(observation.motion_score) if observation.detected else np.nan,
+        "hand_missing_frames": int(observation.missing_frames),
+        "hand_center_x_raw": float(raw_center[0]) if finite_point(raw_center) else np.nan,
+        "hand_center_y_raw": float(raw_center[1]) if finite_point(raw_center) else np.nan,
+        "hand_center_x": kin["hand_center_x"],
+        "hand_center_y": kin["hand_center_y"],
+        "wrist_x": float(wrist[0]) if finite_point(wrist) else np.nan,
+        "wrist_y": float(wrist[1]) if finite_point(wrist) else np.nan,
+        "thumb_tip_x": float(thumb[0]) if finite_point(thumb) else np.nan,
+        "thumb_tip_y": float(thumb[1]) if finite_point(thumb) else np.nan,
+        "index_tip_x": float(index[0]) if finite_point(index) else np.nan,
+        "index_tip_y": float(index[1]) if finite_point(index) else np.nan,
+        "thumb_index_distance_px": float(observation.thumb_index_distance_px) if observation.detected else np.nan,
+        "thumb_index_distance_px_smooth": kin["thumb_index_distance_px_smooth"],
+        "path_length_px_cumulative": kin["path_length_px_cumulative"],
+        "speed_px_s": kin["speed_px_s"],
+        "speed_px_s_smooth": kin["speed_px_s_smooth"],
+        "acceleration_px_s2": kin["acceleration_px_s2"],
+        "acceleration_px_s2_smooth": kin["acceleration_px_s2_smooth"],
+        "speed_px_s_raw": kin["speed_px_s_raw"],
+        "acceleration_px_s2_raw": kin["acceleration_px_s2_raw"],
+        "calibrated": int(calibration.calibrated),
+        "hand_center_board_x": center_board[0],
+        "hand_center_board_y": center_board[1],
+        "wrist_board_x": wrist_board[0],
+        "wrist_board_y": wrist_board[1],
+        "thumb_tip_board_x": thumb_board[0],
+        "thumb_tip_board_y": thumb_board[1],
+        "index_tip_board_x": index_board[0],
+        "index_tip_board_y": index_board[1],
+    }
+    if trial_info is not None:
+        row.update(trial_info.to_row())
+    return row
+
+
+def print_summary(
+    args: argparse.Namespace,
+    fps: float,
+    total_frames: int,
+    rows: List[Dict[str, object]],
+    calibration: BoardCalibration,
+) -> None:
+    df = pd.DataFrame(rows)
+    processed = len(df)
+    detected = int(df["hand_detected"].sum()) if processed else 0
+    detection_rate = float(detected / processed) if processed else 0.0
+    speed = pd.to_numeric(df.get("speed_px_s_smooth", pd.Series(dtype=float)), errors="coerce").dropna()
+    accel = pd.to_numeric(df.get("acceleration_px_s2_smooth", pd.Series(dtype=float)), errors="coerce").dropna()
+    pinch = pd.to_numeric(df.get("thumb_index_distance_px_smooth", pd.Series(dtype=float)), errors="coerce").dropna()
+    total_path = float(pd.to_numeric(df.get("path_length_px_cumulative", pd.Series([0.0])), errors="coerce").dropna().max()) if processed else 0.0
+    duration_s = float(processed / fps) if fps > 0 else 0.0
+    trial_started = bool("trial_started" in df and pd.to_numeric(df["trial_started"], errors="coerce").fillna(0).max() > 0)
+    trial_side = ""
+    trial_start_frame = np.nan
+    if trial_started:
+        started_rows = df[pd.to_numeric(df["trial_started"], errors="coerce").fillna(0) > 0]
+        if not started_rows.empty:
+            trial_side = str(started_rows["trial_side"].iloc[-1]) if "trial_side" in started_rows else ""
+            trial_start_frame = pd.to_numeric(started_rows["trial_start_frame"], errors="coerce").dropna().min()
+
+    print("\nFinal hand pipeline summary")
+    print(f"  input video: {args.input}")
+    print(f"  output video: {args.output}")
+    print(f"  csv output: {args.csv_output}")
+    print(f"  fps: {fps:.3f}")
+    print(f"  total frames: {total_frames}")
+    print(f"  processed frames: {processed}")
+    print(f"  duration_s: {duration_s:.3f}")
+    print(f"  detected_frames: {detected}")
+    print(f"  detection_rate: {detection_rate:.3f}")
+    print(f"  calibration_status: {calibration.status} ({calibration.source})")
+    print(f"  trial_started: {trial_started}")
+    print(f"  trial_side: {trial_side}")
+    print(f"  trial_start_frame: {trial_start_frame}")
+    print(f"  total_path_length_px: {total_path:.3f}")
+    print(f"  mean_speed_px_s: {float(speed.mean()) if not speed.empty else np.nan:.3f}")
+    print(f"  max_speed_px_s: {float(speed.max()) if not speed.empty else np.nan:.3f}")
+    print(f"  mean_acceleration_px_s2: {float(accel.mean()) if not accel.empty else np.nan:.3f}")
+    print(f"  max_acceleration_px_s2: {float(accel.max()) if not accel.empty else np.nan:.3f}")
+    print(f"  mean_thumb_index_distance_px: {float(pinch.mean()) if not pinch.empty else np.nan:.3f}")
+
+
+def main() -> None:
+    args = parse_args()
+    input_path = Path(args.input)
+    output_path = Path(args.output)
+    csv_output_path = Path(args.csv_output)
+    calibration_output_path = Path(args.calibration_output) if args.calibration_output else None
+    ensure_parent(output_path)
+    ensure_parent(csv_output_path)
+    if calibration_output_path is not None:
+        ensure_parent(calibration_output_path)
+
+    cap = cv2.VideoCapture(str(input_path))
+    if not cap.isOpened():
+        raise RuntimeError(f"Could not open input video: {input_path}")
+
+    fps = float(cap.get(cv2.CAP_PROP_FPS) or 25.0)
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    first_frame = first_processed_frame(cap, args.rotate_clockwise)
+    frame_h, frame_w = first_frame.shape[:2]
+
+    if args.calibration_input:
+        calibration = load_calibration(Path(args.calibration_input))
+        if calibration.frame_width != frame_w or calibration.frame_height != frame_h:
+            print(
+                "Warning: calibration dimensions do not match processed video "
+                f"({calibration.frame_width}x{calibration.frame_height} vs {frame_w}x{frame_h})."
+            )
+    else:
+        calibration = calibrate_frame(first_frame, video=str(input_path), allow_manual=True)
+        if calibration_output_path is not None:
+            save_calibration(calibration, calibration_output_path)
+    start_activation_roi = activation_roi_from_calibration(calibration, args.start_gate_padding)
+
+    writer = open_video_writer(output_path, fps, (frame_w + PANEL_WIDTH, frame_h))
+    trial_detector = (
+        TrialLightStartDetector(
+            calibration=calibration,
+            frame_shape=first_frame.shape,
+            fps=fps,
+            light_delta_threshold=args.light_delta_threshold,
+            side_gap_threshold=args.light_side_gap_threshold,
+            both_stable_frames=args.both_light_frames,
+            side_stable_frames=args.single_light_frames,
+        )
+        if args.trial_light_start == "on"
+        else None
+    )
+    tracker = MediaPipeHandTracker(
+        start_gate_enabled=args.start_gate == "center",
+        start_gate_scale=args.start_gate_scale,
+        activation_consecutive_frames=args.start_gate_hits,
+        max_lock_jump_px=args.hand_lock_radius_px,
+        max_reacquire_jump_px=args.hand_reacquire_radius_px,
+        motion_weight=args.motion_weight,
+        min_start_motion_score=args.min_start_motion_score,
+        min_reacquire_motion_score=args.min_reacquire_motion_score,
+        reacquire_consecutive_frames=args.reacquire_hits,
+    )
+    kinematics = KinematicsTracker(args.smooth_alpha, args.smooth_window)
+    trail: Deque[Tuple[int, int]] = deque(maxlen=max(1, int(args.trail_length)))
+    history: Dict[str, Deque[float]] = {
+        "path": deque(maxlen=360),
+        "speed": deque(maxlen=360),
+        "acceleration": deque(maxlen=360),
+        "thumb_index": deque(maxlen=360),
+    }
+    rows: List[Dict[str, object]] = []
+    show_ok = bool(args.show)
+    if show_ok:
+        try:
+            cv2.namedWindow("final hand pipeline", cv2.WINDOW_NORMAL)
+        except cv2.error:
+            show_ok = False
+
+    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+    frame_idx = 0
+    try:
+        while True:
+            if args.max_frames and frame_idx >= args.max_frames:
+                break
+            ok, frame = cap.read()
+            if not ok:
+                break
+            frame = rotate_if_needed(frame, args.rotate_clockwise)
+            time_s = frame_idx / fps
+            trial_info = trial_detector.update(frame_idx, frame) if trial_detector is not None else None
+            activation_roi = tracker.get_activation_roi(frame.shape, calibration.board_roi, start_activation_roi)
+            observation = tracker.detect(frame, calibration.board_roi, start_activation_roi)
+            kin = kinematics.update(time_s, observation.detected, observation.center_raw, observation.thumb_index_distance_px)
+            smoothed_center = None
+            if np.isfinite(kin["hand_center_x"]) and np.isfinite(kin["hand_center_y"]):
+                smoothed_center = (float(kin["hand_center_x"]), float(kin["hand_center_y"]))
+                trail.append((int(round(smoothed_center[0])), int(round(smoothed_center[1]))))
+
+            history["path"].append(float(kin["path_length_px_cumulative"]))
+            history["speed"].append(float(kin["speed_px_s_smooth"]))
+            history["acceleration"].append(float(kin["acceleration_px_s2_smooth"]))
+            history["thumb_index"].append(float(kin["thumb_index_distance_px_smooth"]))
+
+            rows.append(build_row(frame_idx, time_s, observation, kin, calibration, trial_info))
+            display_frame = frame.copy()
+            if trial_detector is not None and trial_info is not None:
+                trial_detector.draw_zones(display_frame, trial_info)
+            composed = compose_frame(
+                display_frame,
+                calibration,
+                observation,
+                smoothed_center,
+                list(trail),
+                history,
+                fps,
+                args.smooth_window,
+                activation_roi=activation_roi,
+                trial_info=trial_info,
+            )
+            writer.write(composed)
+            if show_ok:
+                cv2.imshow("final hand pipeline", composed)
+                if cv2.waitKey(1) & 0xFF == ord("q"):
+                    break
+            frame_idx += 1
+    finally:
+        cap.release()
+        writer.release()
+        tracker.close()
+        if show_ok:
+            cv2.destroyAllWindows()
+
+    pd.DataFrame(rows).to_csv(csv_output_path, index=False)
+    print_summary(args, fps, total_frames, rows, calibration)
+
+
+if __name__ == "__main__":
+    main()
