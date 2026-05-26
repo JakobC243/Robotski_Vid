@@ -1,9 +1,0 @@
-numpy<2
-opencv-contrib-python==4.11.0.86
-pandas
-matplotlib
-scipy
-scikit-image
-mediapipe==0.10.14
-scikit-learn
-joblib

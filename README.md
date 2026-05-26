@@ -224,10 +224,6 @@ Lahko odstranis oziroma ne prenasas naprej:
   `test_detect_side_hole_grids.py`.
 - `mediapipe_gui_tracking/`: star GUI/prototip, ni del aktualnega `final`
   pipeline-a.
-- `run_local.ps1`: trenutno klice stare skripte, zato ga odstrani ali prepisuj
-  samo, ce ga bos res uporabljal za nov `final/run_hand_pipeline.py`.
-- `requirements-local.txt` in `test_env.py`: stara Docker/lokalna diagnostika,
-  nista potrebna za aktualni final pipeline.
 - `poganjanja.txt`: osebni zapiski, ni potreben za delovanje.
 
 ## Glavne datoteke v final
