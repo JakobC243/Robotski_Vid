@@ -67,12 +67,14 @@ class PegOccupancyDetector:
         self,
         calibration: BoardCalibration,
         stable_frames: int = 5,
+        post_cover_clear_frames: int = 3,
         sample_radius_scale: float = 0.30,
         change_threshold: float = 0.32,
         reference_alpha: float = 0.06,
     ) -> None:
         self.grids = self._build_grids(calibration, sample_radius_scale)
         self.stable_frames = int(max(1, stable_frames))
+        self.post_cover_clear_frames = int(max(1, post_cover_clear_frames))
         self.change_threshold = float(max(0.05, change_threshold))
         self.reference_alpha = float(np.clip(reference_alpha, 0.0, 0.30))
         self.references: Dict[str, List[Optional[PegPatch]]] = {side: [None] * 9 for side in SIDES}
@@ -82,8 +84,14 @@ class PegOccupancyDetector:
         self.candidate_states: Dict[str, List[Optional[int]]] = {side: [None] * 9 for side in SIDES}
         self.candidate_counts: Dict[str, List[int]] = {side: [0] * 9 for side in SIDES}
         self.reference_bootstrap_done: Dict[str, bool] = {side: False for side in SIDES}
+        self.was_covered: Dict[str, bool] = {side: False for side in SIDES}
+        self.clear_frames_after_cover: Dict[str, int] = {side: 0 for side in SIDES}
         self.last_target_side = ""
         self.target_phase = "tracking"
+
+    def _reset_candidates(self, side: str) -> None:
+        self.candidate_states[side] = [None] * 9
+        self.candidate_counts[side] = [0] * 9
 
     def _build_grids(self, calibration: BoardCalibration, sample_radius_scale: float) -> Dict[str, PegGrid]:
         grids = []
@@ -269,6 +277,8 @@ class PegOccupancyDetector:
             self.candidate_states[side] = [None] * 9
             self.candidate_counts[side] = [0] * 9
             self.reference_bootstrap_done[side] = False
+            self.was_covered[side] = False
+            self.clear_frames_after_cover[side] = 0
 
     def update(
         self,
@@ -292,8 +302,22 @@ class PegOccupancyDetector:
 
             if covered.get(side, False):
                 self.visible[side] = [0] * 9
+                self.scores[side] = [float("nan")] * 9
+                self._reset_candidates(side)
+                self.was_covered[side] = True
+                self.clear_frames_after_cover[side] = 0
                 if reference_bootstrap and measurement_active and not self.reference_bootstrap_done.get(side, False):
                     self.target_phase = "waiting_clear_reference"
+                continue
+
+            if self.was_covered.get(side, False):
+                self.visible[side] = [0] * 9
+                self.scores[side] = [float("nan")] * 9
+                self._reset_candidates(side)
+                self.clear_frames_after_cover[side] += 1
+                if self.clear_frames_after_cover[side] < self.post_cover_clear_frames:
+                    continue
+                self.was_covered[side] = False
                 continue
 
             if reference_bootstrap and measurement_active and not self.reference_bootstrap_done.get(side, False):
@@ -306,6 +330,7 @@ class PegOccupancyDetector:
                     continue
 
             baseline_state = self._baseline_state(side, target_side)
+            observations = []
             for idx, point in enumerate(grid.points[:9]):
                 patch = self._patch(frame_bgr, point, grid.sample_radius)
                 if patch is None:
@@ -322,7 +347,20 @@ class PegOccupancyDetector:
                 self.scores[side][idx] = score
                 changed = bool(score >= self.change_threshold)
                 raw_state = int(1 - baseline_state) if changed else int(baseline_state)
+                observations.append((idx, patch, reference, raw_state, changed))
 
+            visible_count = len(observations)
+            changed_count = sum(1 for idx, _, _, raw_state, changed in observations if changed and self.states[side][idx] != raw_state)
+            global_change_limit = max(4, int(np.ceil(0.65 * max(1, visible_count))))
+            global_change = bool(visible_count >= 5 and changed_count >= global_change_limit)
+            if global_change:
+                self._reset_candidates(side)
+                for idx, patch, reference, raw_state, changed in observations:
+                    self.references[side][idx] = self._blend_reference(reference, patch)
+                    self.states[side][idx] = int(baseline_state)
+                continue
+
+            for idx, patch, reference, raw_state, changed in observations:
                 if not measurement_active:
                     self.references[side][idx] = self._blend_reference(reference, patch)
                     self.states[side][idx] = baseline_state

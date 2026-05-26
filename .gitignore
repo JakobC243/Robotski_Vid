@@ -24,6 +24,20 @@ Thumbs.db
 *.rar
 *.exe
 
+# LaTeX build artifacts
+*.aux
+*.bbl
+*.blg
+*.brf
+*.fdb_latexmk
+*.fls
+*.lof
+*.lot
+*.out
+*.synctex.gz
+*.toc
+LaTeX_example/_build/
+
 __MACOSX/
 vaje/
 

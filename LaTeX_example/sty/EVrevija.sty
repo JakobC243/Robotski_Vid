@@ -1,0 +1,185 @@
+% EVrevija.sty
+\typeout{Document Style `Elektrotehniski vestnik' ver 2.0 beta}
+
+% EVrevija, slog za slovensko izdajo revije Elektrotehniski vestnik
+% Beta verzija 2.0, pripravil A. Trost 
+% Temelji na predlogi ev.sty avtorjev: I. Erjavec, F. Solina, P. Peer
+% Zahvala: pri priravi sloga je pomagal prof. A. Kosir
+
+\topmargin -5.4mm
+\headheight 5mm \headsep 5mm
+\textheight 240mm
+
+\oddsidemargin -2.9mm
+\evensidemargin -2.9mm
+\textwidth 165mm \columnsep 5mm \columnseprule 0pt
+
+\renewcommand{\thefootnote}{\fnsymbol{footnote}}
+
+\def\title#1{\gdef\@title{#1}}
+\def\@title{???}
+
+\def\address#1{\gdef\@address{#1}}
+\def\@address{???}
+
+\def\authors#1{\gdef\@authors{#1}}
+\def\@authors{???}
+
+\def\authorsLast#1{\gdef\@authorsLast{#1}}
+\def\@authorsLast{???}
+
+\long\def\abstract#1{\long\gdef\@abstract{#1}}
+\long\def\@abstract{???}
+
+\def\keywords#1{\gdef\@keywords{#1}}
+\def\@keywords{???}
+
+\def\received#1{\gdef\@received{#1}}
+\def\@received{???}
+
+\def\review#1{\gdef\@review{#1}}
+\def\@review{???}
+
+%\def\small{\@setsize\small{9pt}\ixpt\@ixpt
+%\abovedisplayskip 8.5pt plus 3pt minus 4pt\belowdisplayskip \abovedisplayskip
+%\abovedisplayshortskip \z@ plus2pt\belowdisplayshortskip 4pt plus2pt minus 2pt
+%\def\@listi{\topsep 2pt plus 1pt minus 1pt\itemsep 1pt plus .5pt minus .5pt
+%\parsep 0pt}}
+
+%\def\scriptsize{\@setsize\scriptsize{8pt}\viipt\@viipt}
+\def\scriptsize{\@setfontsize{\scriptsize}{8}{9pt}} %9pt script, A.T.
+
+\def\tiny{\@setsize\tiny{6pt}\vpt\@vpt}
+\def\large{\@setsize\large{12pt}\xiipt\@xiipt}   %Section, A.T.
+\def\hlarge{\@setsize\large{11pt}\xipt\@xipt}    %SubSection A.T.
+\def\Large{\@setsize\Large{18pt}\xivpt\@xivpt}
+\def\LARGE{\@setsize\LARGE{22pt}\xviipt\@xviipt} %Title
+\def\huge{\@setsize\huge{25pt}\xxpt\@xxpt}
+\def\Huge{\@setsize\Huge{30pt}\xxvpt\@xxvpt}
+
+\def\thesection {\arabic{section}}
+\def\thesubsection{\thesection.\arabic{subsection}} % A.T. dodal zaradi IEEE, ne dela?
+\def\thesubsubsection{\thesubsection.\arabic{subsubsection}}
+\def\theparagraph{\thesubsubsection.\arabic{paragraph}}
+\def\thesectiondis{\thesection}                   % 1.
+\def\thesubsectiondis{\thesection.\arabic{subsection}}          % 1.2
+\def\thesubsubsectiondis{\thesubsection.\arabic{subsubsection}}  % 1.2.1
+\def\theparagraphdis{\thesubsubsection-\Alph{paragraph})}            % 1.2.1-A
+
+% A.T. oblikovanje headerjev po IEEEtran.cls predlogi
+%\markboth{\@authorsLast}{\@title}
+% definicije headerjev po stari predlogi
+
+% A.T. oblikovanje naslovov
+\def\section{\@startsection {section}{1}{\z@}{-3.25ex plus -1ex minus -.2ex}{1.5ex plus .2ex}{\normalfont\large\centering\scshape\bfseries}}%{\raggedright\hlarge\bf}}
+
+\def\subsection{\@startsection{subsection}{2}{\z@}{1.5ex plus 1.5ex minus 0.5ex}%
+{0.7ex plus .5ex minus 0ex}{\normalfont\hlarge\itshape}}%
+
+% Naslovnica
+\def\maketitle{\clearpage\thispagestyle{empty}
+
+\@topnewpage[\vbox to 0pt{\offinterlineskip\vss\hbox{\footnotesize\scshape \@ArtJournalText 78(x): \pageref{start}--\pageref{finish}, 2011}\vskip.5mm\hbox{\footnotesize\scshape Existing separate English edition}\vskip4mm}
+\vskip10mm
+\vbox{\hsize=145mm
+\begin{raggedright}
+{\LARGE\bf\@title}\\[8mm]
+{\hlarge\bf\@authors}\\[2mm]
+{\small\it\@address}\\[4mm]
+\end{raggedright}
+{{\small\bf\@AbstractText}\small\@abstract}\\[2mm]
+{{\small\bf \@KeyWordsText}{\small\@keywords}}\\[5mm]
+}]
+%\vskip5mm}] %peter 10mm -> 5mm
+\footnotetext{\hspace*{-1.8em}\it\@ArtRecText\@received\\
+	      \@ArtRevText\@review}
+}
+
+\def\footnoterule{\kern-3\p@
+ \hrule width .6\columnwidth
+ \kern 2.6\p@}
+\@addtoreset{footnote}{section}
+\long\def\@makefntext#1{\parindent 1em\noindent
+ \hbox to 1.8em{\hss$^{\@thefnmark}$}#1}
+
+\gdef\@ArtRecText{Prejet\ }
+\gdef\@ArtRevText{Odobren\ }
+\gdef\@BIBtext{Literatura}
+\gdef\@FIGtext{Slika\ }
+\gdef\@TABtext{Tabela\ }
+\global\def\@KeyWordsText{Klju\v{c}ne besede:\ }
+\gdef\@AbstractText{Povzetek.\ }
+\gdef\@ArtJournalText{Elektrotehni\v{s}ki vestnik\ }
+
+ 
+\def\english#1#2{\small %\noindent 
+\begin{center} \textbf{#1} \end{center}\vskip1mm 
+%\noindent %{\bf Abstract.} 
+{#2 \par} \normalsize}
+
+\setcounter{figure}{0}
+\setcounter{page}{1}
+\label{start}
+
+%\long\def\@caption#1[#2]#3{\par
+%%\addcontentsline{\csname
+%%  ext@#1\endcsname}{#1}{\protect\numberline{\csname 
+%%  the#1\endcsname}{\ignorespaces #2}}
+  %\begingroup
+    %\@parboxrestore
+    %\small
+    %\@makecaption{\csname fnum@#1\endcsname}{\ignorespaces #3}\par
+  %\endgroup}
+%
+
+%A.T. izbira med centriranimi in levo poravnanimi captioni
+%\long\def\@makecaption#1#2{
+ %\vskip 5pt %10pt
+ %\setbox\@tempboxa\hbox{\small #1 #2}
+ %\ifdim \wd\@tempboxa >\hsize \unhbox\@tempboxa\par \else \hbox
+%to\hsize{\hfil\box\@tempboxa\hfil}
+ %\fi}
+\long\def\@makecaption#1#2{
+\vskip 5pt
+{\small #1 #2}
+}
+
+\def\thefigure{\@arabic\c@figure}
+\def\fps@figure{htbp}
+\def\ftype@figure{1}
+\def\ext@figure{lof}
+\def\fnum@figure{\@FIGtext \thefigure:} % Slovene: Slika n:
+\def\figure{\@float{figure}}
+\let\endfigure\end@float
+\@namedef{figure*}{\@dblfloat{figure}}
+\@namedef{endfigure*}{\end@dblfloat}
+
+\def\thetable{\@arabic\c@table}
+\def\fps@table{tbp}
+\def\ftype@table{2}
+\def\ext@table{lot}
+\def\fnum@table{\@TABtext \thetable:} % Slovene: Tabela n:
+\def\table{\@float{table}}
+\let\endtable\end@float
+\@namedef{table*}{\@dblfloat{table}}
+\@namedef{endtable*}{\end@dblfloat}
+
+\newcounter{alg} % [section]    25.5.1990
+\def\thealg{\@arabic\c@alg}
+\def\fps@alg{htbp}
+\def\ftype@alg{3}
+\def\ext@alg{alg}
+\def\fnum@alg{Algoritem \thealg:} % Slovene: Algoritem n:
+\def\alg{\@float{alg}}
+\let\endalg\end@float
+\@namedef{alg*}{\@dblfloat{alg}}
+\@namedef{endalg*}{\end@dblfloat}
+
+
+% A.T. patch za IEEEtran.cls as it happens with other classes that need to set the header text to uppercase. 
+% Napaka: Package babel Error: You haven't defined the language SLOVENE yet.
+\makeatletter
+\def\markboth#1#2{\def\leftmark{\@IEEEcompsoconly{\sffamily}\MakeUppercase{\protect#1}}%
+\def\rightmark{\@IEEEcompsoconly{\sffamily}\MakeUppercase{\protect#2}}}
+\makeatother
+

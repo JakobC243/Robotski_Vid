@@ -9,7 +9,7 @@ import cv2
 import numpy as np
 import pandas as pd
 
-from calibration import BoardCalibration, ImageRegion, build_calibration_from_hole_grids, calibrate_frame, load_calibration, save_calibration
+from calibration import BoardCalibration, ImageRegion, calibrate_best_frame, load_calibration, save_calibration
 from hand_tracking import MediaPipeHandTracker
 from kinematics import KinematicsTracker
 from peg_detection import PegOccupancyDetector
@@ -58,6 +58,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--field-roi-padding", type=float, default=0.75, help="Padding in hole-spacing units around each 3x3 pin field for the first hand-in-field diagnostic.")
     parser.add_argument("--peg-detection", choices=["on", "off"], default="on", help="Detect inserted pegs from stable local changes around calibrated 3x3 holes.")
     parser.add_argument("--peg-stable-frames", type=int, default=5, help="Stable frames needed before a peg hole changes occupied/empty state.")
+    parser.add_argument("--peg-post-cover-clear-frames", type=int, default=3, help="Clear frames after a hand leaves a peg field before peg state can change.")
     parser.add_argument("--peg-change-threshold", type=float, default=0.32, help="Local patch-change threshold for peg occupancy.")
     parser.add_argument("--trial-end-peg-threshold", type=int, default=8, help="Target peg count that must be reached before an empty target field can stop the trial timer.")
     parser.add_argument("--trial-end-empty-frames", type=int, default=5, help="Consecutive stable empty target-field frames needed to stop the trial timer.")
@@ -71,70 +72,19 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def first_processed_frame(cap: cv2.VideoCapture, rotate_clockwise: bool) -> np.ndarray:
-    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-    ok, frame = cap.read()
-    if not ok:
-        raise RuntimeError("Could not read first frame from input video.")
-    return rotate_if_needed(frame, rotate_clockwise)
-
-
-def calibration_quality(calibration: BoardCalibration) -> float:
-    if calibration is None or len(calibration.hole_grids) < 2:
-        return float("-inf")
-    matches = 0
-    errors = []
-    inferred_count = 0
-    for grid in calibration.hole_grids:
-        matches += int(grid.get("matches", 0))
-        mean_error = float(grid.get("mean_error_px", float("nan")))
-        if np.isfinite(mean_error):
-            errors.append(mean_error)
-        if bool(grid.get("inferred", False)):
-            inferred_count += 1
-    mean_error = float(np.mean(errors)) if errors else 99.0
-    return float(matches * 1000.0 - mean_error * 80.0 - inferred_count * 250.0)
-
-
-def scan_start_calibration(
-    cap: cv2.VideoCapture,
-    first_frame: np.ndarray,
-    rotate_clockwise: bool,
-    video: str,
-    scan_frames: int,
-    scan_step: int,
-) -> Optional[BoardCalibration]:
-    scan_frames = int(max(1, scan_frames))
-    scan_step = int(max(1, scan_step))
-    frame_indices = [0]
-    frame_indices.extend(range(scan_step, scan_frames, scan_step))
-
-    best_calibration: Optional[BoardCalibration] = None
-    best_score = float("-inf")
-    best_frame_idx = 0
-    for frame_idx in frame_indices:
-        if frame_idx == 0:
-            frame = first_frame
-        else:
-            cap.set(cv2.CAP_PROP_POS_FRAMES, int(frame_idx))
-            ok, raw_frame = cap.read()
-            if not ok:
-                continue
-            frame = rotate_if_needed(raw_frame, rotate_clockwise)
-        calibration = build_calibration_from_hole_grids(frame, video=video)
-        if calibration is None:
+def first_processed_frames(cap: cv2.VideoCapture, rotate_clockwise: bool, count: int, step: int) -> List[Tuple[int, np.ndarray]]:
+    frames: List[Tuple[int, np.ndarray]] = []
+    scan_frames = int(max(1, count))
+    scan_step = int(max(1, step))
+    for frame_idx in range(0, scan_frames, scan_step):
+        cap.set(cv2.CAP_PROP_POS_FRAMES, int(frame_idx))
+        ok, frame = cap.read()
+        if not ok:
             continue
-        score = calibration_quality(calibration)
-        if score > best_score:
-            best_score = score
-            best_calibration = calibration
-            best_frame_idx = int(frame_idx)
-
-    if best_calibration is not None:
-        if best_frame_idx != 0:
-            best_calibration.source = f"hole_grid_scan_frame_{best_frame_idx}"
-        return best_calibration
-    return None
+        frames.append((int(frame_idx), rotate_if_needed(frame, rotate_clockwise)))
+    if not frames:
+        raise RuntimeError("Could not read frames from input video.")
+    return frames
 
 
 def board_point(calibration: BoardCalibration, point: Optional[Tuple[float, float]]) -> Tuple[float, float]:
@@ -569,7 +519,13 @@ def main() -> None:
 
     fps = float(cap.get(cv2.CAP_PROP_FPS) or 25.0)
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-    first_frame = first_processed_frame(cap, args.rotate_clockwise)
+    calibration_frames = first_processed_frames(
+        cap,
+        args.rotate_clockwise,
+        args.calibration_scan_frames,
+        args.calibration_scan_step,
+    )
+    first_frame = calibration_frames[0][1]
     frame_h, frame_w = first_frame.shape[:2]
 
     if args.calibration_input:
@@ -580,16 +536,12 @@ def main() -> None:
                 f"({calibration.frame_width}x{calibration.frame_height} vs {frame_w}x{frame_h})."
             )
     else:
-        calibration = scan_start_calibration(
-            cap=cap,
-            first_frame=first_frame,
-            rotate_clockwise=args.rotate_clockwise,
-            video=str(input_path),
-            scan_frames=args.calibration_scan_frames,
-            scan_step=args.calibration_scan_step,
+        calibration = calibrate_best_frame(calibration_frames, video=str(input_path), allow_manual=True)
+        print(
+            "Calibration selected "
+            f"source={calibration.source}, frame={calibration.calibration_frame_idx}, "
+            f"holes={len(calibration.holes)}, candidates={calibration.hole_candidate_count}"
         )
-        if calibration is None:
-            calibration = calibrate_frame(first_frame, video=str(input_path), allow_manual=True)
         if calibration_output_path is not None:
             save_calibration(calibration, calibration_output_path)
     start_activation_roi = activation_roi_from_calibration(calibration, args.start_gate_padding)
@@ -600,13 +552,14 @@ def main() -> None:
         PegOccupancyDetector(
             calibration=calibration,
             stable_frames=args.peg_stable_frames,
+            post_cover_clear_frames=args.peg_post_cover_clear_frames,
             change_threshold=args.peg_change_threshold,
         )
         if args.peg_detection == "on"
         else None
     )
 
-    writer = open_video_writer(output_path, fps, (frame_w + PANEL_WIDTH, frame_h))
+    writer = open_video_writer(output_path, fps, (frame_w + 2 * PANEL_WIDTH, frame_h))
     trial_detector = (
         TrialLightStartDetector(
             calibration=calibration,
@@ -645,6 +598,14 @@ def main() -> None:
         "speed": deque(maxlen=360),
         "acceleration": deque(maxlen=360),
         "thumb_index": deque(maxlen=360),
+    }
+    finger_history: Dict[str, Deque[float]] = {
+        "thumb_path": deque(maxlen=360),
+        "thumb_speed": deque(maxlen=360),
+        "thumb_acceleration": deque(maxlen=360),
+        "index_path": deque(maxlen=360),
+        "index_speed": deque(maxlen=360),
+        "index_acceleration": deque(maxlen=360),
     }
     rows: List[Dict[str, object]] = []
     measurement_started = bool(args.measure_from == "immediate" or trial_detector is None)
@@ -713,7 +674,8 @@ def main() -> None:
             )
             if should_start_from_light or should_start_from_hand:
                 measurement_started = True
-                measurement_start_frame = int(frame_idx)
+                detected_start_frame = int(getattr(trial_info, "trial_start_frame", -1)) if should_start_from_light else -1
+                measurement_start_frame = detected_start_frame if detected_start_frame >= 0 else int(frame_idx)
                 measurement_end_frame = -1
                 measurement_completed = False
                 measurement_start_source = "light" if should_start_from_light else "hand_field"
@@ -726,6 +688,8 @@ def main() -> None:
                 index_kinematics.reset()
                 trail.clear()
                 for values in history.values():
+                    values.clear()
+                for values in finger_history.values():
                     values.clear()
 
             measurement_running = bool(measurement_started and not measurement_completed)
@@ -805,6 +769,12 @@ def main() -> None:
                 history["speed"].append(float(kin["speed_mm_s_smooth"]))
                 history["acceleration"].append(float(kin["acceleration_mm_s2_smooth"]))
                 history["thumb_index"].append(float(kin["thumb_index_distance_mm_smooth"]))
+                finger_history["thumb_path"].append(float(thumb_kin["path_length_mm_cumulative"]))
+                finger_history["thumb_speed"].append(float(thumb_kin["speed_mm_s_smooth"]))
+                finger_history["thumb_acceleration"].append(float(thumb_kin["acceleration_mm_s2_smooth"]))
+                finger_history["index_path"].append(float(index_kin["path_length_mm_cumulative"]))
+                finger_history["index_speed"].append(float(index_kin["speed_mm_s_smooth"]))
+                finger_history["index_acceleration"].append(float(index_kin["acceleration_mm_s2_smooth"]))
 
             rows.append(
                 build_row(
@@ -841,6 +811,7 @@ def main() -> None:
                 smoothed_center,
                 list(trail),
                 history,
+                finger_history,
                 fps,
                 args.smooth_window,
                 activation_roi=activation_roi,

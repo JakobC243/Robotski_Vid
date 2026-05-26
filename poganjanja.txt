@@ -1,2 +1,0 @@
-za run naredi docker run -it -v ........ime_ python3 run.py -patient/worker/data/patient1
-                                                            -folder /data/

@@ -6,7 +6,7 @@ from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Sequence, Tuple, Union
 
 import cv2
 import numpy as np
@@ -702,6 +702,7 @@ class BoardCalibration:
     source: str
     created_at: str
     video: str
+    calibration_frame_idx: int = 0
 
     @property
     def calibrated(self) -> bool:
@@ -817,6 +818,7 @@ class BoardCalibration:
             "source": self.source,
             "created_at": self.created_at,
             "video": self.video,
+            "calibration_frame_idx": int(self.calibration_frame_idx),
         }
 
     @classmethod
@@ -838,6 +840,7 @@ class BoardCalibration:
             source=str(data.get("source", "json")),
             created_at=str(data.get("created_at", "")),
             video=str(data.get("video", "")),
+            calibration_frame_idx=int(data.get("calibration_frame_idx", 0)),
         )
 
 
@@ -986,6 +989,60 @@ def build_calibration_from_hole_grids(frame: np.ndarray, video: str = "") -> Opt
     return calibration
 
 
+def calibration_quality_score(calibration: BoardCalibration) -> float:
+    grid_count = len(calibration.hole_grids)
+    hole_count = len(calibration.holes)
+    matched_holes = sum(1 for hole in calibration.holes if bool(hole.matched))
+    grid_score = sum(float(grid.get("score", 0.0)) for grid in calibration.hole_grids)
+    spacing_values = []
+    for grid in calibration.hole_grids:
+        spacing_values.extend(
+            [
+                float(grid.get("spacing_u_px", 0.0)),
+                float(grid.get("spacing_v_px", 0.0)),
+            ]
+        )
+    spacing_values = [value for value in spacing_values if np.isfinite(value) and value > 0.0]
+    spacing_penalty = float(np.std(spacing_values)) if spacing_values else 100.0
+    return (
+        100000.0 * grid_count
+        + 2500.0 * matched_holes
+        + 250.0 * hole_count
+        + 5.0 * min(60, int(calibration.hole_candidate_count))
+        + 0.05 * grid_score
+        - 50.0 * spacing_penalty
+    )
+
+
+def calibrate_best_frame(
+    frames: Sequence[Tuple[int, np.ndarray]],
+    video: str = "",
+    allow_manual: bool = True,
+) -> BoardCalibration:
+    if not frames:
+        raise RuntimeError("No frames available for calibration.")
+
+    best_calibration: Optional[BoardCalibration] = None
+    best_score = -float("inf")
+    for frame_idx, frame in frames:
+        calibration = build_calibration_from_hole_grids(frame, video=video)
+        if calibration is None:
+            continue
+        calibration.calibration_frame_idx = int(frame_idx)
+        score = calibration_quality_score(calibration)
+        if score > best_score:
+            best_score = score
+            best_calibration = calibration
+
+    if best_calibration is not None:
+        return best_calibration
+
+    fallback_idx, fallback_frame = frames[0]
+    calibration = calibrate_frame(fallback_frame, video=video, allow_manual=allow_manual)
+    calibration.calibration_frame_idx = int(fallback_idx)
+    return calibration
+
+
 def auto_detect_board_corners(frame: np.ndarray) -> Optional[np.ndarray]:
     h, w = frame.shape[:2]
     frame_area = float(h * w)
@@ -1105,7 +1162,6 @@ def draw_calibration(frame: np.ndarray, calibration: BoardCalibration) -> None:
         for idx, point in enumerate(corners):
             cv2.circle(frame, tuple(point), 4, (0, 220, 255), -1, cv2.LINE_AA)
             cv2.putText(frame, str(idx + 1), (int(point[0]) + 5, int(point[1]) - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 220, 255), 1, cv2.LINE_AA)
-        cv2.putText(frame, "CALIBRATED", (15, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 220, 255), 2, cv2.LINE_AA)
         if calibration.inverse_homography_matrix is not None:
             axes = np.asarray([[[0, 0], [80, 0], [0, 80]]], dtype=np.float32)
             image_axes = cv2.perspectiveTransform(axes, calibration.inverse_homography_matrix)[0]
@@ -1139,17 +1195,6 @@ def draw_calibration(frame: np.ndarray, calibration: BoardCalibration) -> None:
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.32,
                 color,
-                1,
-                cv2.LINE_AA,
-            )
-        if calibration.holes:
-            cv2.putText(
-                frame,
-                f"HOLES {len(calibration.holes)} candidates={calibration.hole_candidate_count}",
-                (15, 50),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.48,
-                (60, 255, 120),
                 1,
                 cv2.LINE_AA,
             )

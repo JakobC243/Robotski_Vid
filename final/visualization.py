@@ -130,6 +130,50 @@ def draw_landmark_metrics(image: np.ndarray, landmark_metrics: Optional[Dict[str
         y += 80
 
 
+def draw_multi_graph(
+    panel: np.ndarray,
+    x: int,
+    y: int,
+    w: int,
+    h: int,
+    title: str,
+    series: Sequence[Tuple[str, Sequence[float], Tuple[int, int, int]]],
+    smooth_window: int,
+) -> None:
+    cv2.rectangle(panel, (x, y), (x + w, y + h), (52, 56, 62), 1)
+    cv2.putText(panel, title, (x, y - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (230, 230, 230), 1, cv2.LINE_AA)
+    prepared = []
+    finite_parts = []
+    for label, values, color in series:
+        arr = np.asarray(list(values)[-w:], dtype=np.float32)
+        smooth = moving_average_nan(arr, smooth_window)
+        prepared.append((label, smooth, color))
+        finite = smooth[np.isfinite(smooth)]
+        if finite.size:
+            finite_parts.append(finite)
+    if not finite_parts:
+        return
+    finite_all = np.concatenate(finite_parts)
+    if finite_all.size < 2:
+        return
+    v_min = float(np.min(finite_all))
+    v_max = float(np.max(finite_all))
+    if abs(v_max - v_min) < 1e-6:
+        v_max = v_min + 1.0
+    for label, smooth, color in prepared:
+        points = []
+        for idx, value in enumerate(smooth):
+            if not np.isfinite(value):
+                points.append(None)
+                continue
+            px = x + int(round(idx * (w - 1) / max(1, len(smooth) - 1)))
+            py = y + h - 4 - int(round((float(value) - v_min) / (v_max - v_min) * (h - 8)))
+            points.append((px, py))
+        for p1, p2 in zip(points[:-1], points[1:]):
+            if p1 is not None and p2 is not None:
+                cv2.line(panel, p1, p2, color, 1, cv2.LINE_AA)
+
+
 def draw_field_regions(image: np.ndarray, field_regions: Sequence[Dict], hand_field_zone: str) -> None:
     if not field_regions:
         return
@@ -214,6 +258,91 @@ def draw_timeseries_panel(panel: np.ndarray, history: Dict[str, Deque[float]], f
     cv2.putText(panel, f"fps={fps:.1f}  smooth={smooth_window}", (16, panel.shape[0] - 14), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (170, 175, 185), 1, cv2.LINE_AA)
 
 
+def latest(history: Dict[str, Deque[float]], key: str) -> float:
+    values = history.get(key)
+    if not values:
+        return float("nan")
+    for value in reversed(values):
+        if np.isfinite(value):
+            return float(value)
+    return float("nan")
+
+
+def draw_finger_panel(
+    panel: np.ndarray,
+    finger_history: Dict[str, Deque[float]],
+    landmark_metrics: Optional[Dict[str, Dict[str, float]]],
+    fps: float,
+    smooth_window: int,
+) -> None:
+    panel[:] = (28, 31, 36)
+    cv2.putText(panel, "thumb / index kinematics", (16, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (245, 245, 245), 1, cv2.LINE_AA)
+
+    thumb_color = (80, 220, 255)
+    index_color = (255, 110, 220)
+    cv2.line(panel, (18, 50), (54, 50), thumb_color, 2, cv2.LINE_AA)
+    cv2.putText(panel, "PAL", (62, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.42, thumb_color, 1, cv2.LINE_AA)
+    cv2.line(panel, (126, 50), (162, 50), index_color, 2, cv2.LINE_AA)
+    cv2.putText(panel, "KAZ", (170, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.42, index_color, 1, cv2.LINE_AA)
+
+    thumb_values = (landmark_metrics or {}).get("thumb", {})
+    index_values = (landmark_metrics or {}).get("index", {})
+    rows = [
+        ("PAL d", float(thumb_values.get("path_mm", latest(finger_history, "thumb_path"))), "mm", thumb_color),
+        ("PAL v", float(thumb_values.get("speed_mm_s", latest(finger_history, "thumb_speed"))), "mm/s", thumb_color),
+        ("PAL a", float(thumb_values.get("accel_mm_s2", latest(finger_history, "thumb_acceleration"))), "mm/s2", thumb_color),
+        ("KAZ d", float(index_values.get("path_mm", latest(finger_history, "index_path"))), "mm", index_color),
+        ("KAZ v", float(index_values.get("speed_mm_s", latest(finger_history, "index_speed"))), "mm/s", index_color),
+        ("KAZ a", float(index_values.get("accel_mm_s2", latest(finger_history, "index_acceleration"))), "mm/s2", index_color),
+    ]
+    y = 82
+    for idx, (label, value, unit, color) in enumerate(rows):
+        col_x = 16 if idx < 3 else 196
+        row_y = y + 20 * (idx % 3)
+        text = f"{label}: {metric_value(value)} {unit}"
+        cv2.putText(panel, text, (col_x, row_y), cv2.FONT_HERSHEY_SIMPLEX, 0.40, color, 1, cv2.LINE_AA)
+
+    graph_w = panel.shape[1] - 32
+    graph_h = max(46, min(100, (panel.shape[0] - 188) // 3))
+    graph_gap = 28
+    y0 = 150
+    specs = [
+        (
+            "d(t) path mm",
+            "thumb_path",
+            "index_path",
+        ),
+        (
+            "v(t) mm/s",
+            "thumb_speed",
+            "index_speed",
+        ),
+        (
+            "a(t) mm/s2",
+            "thumb_acceleration",
+            "index_acceleration",
+        ),
+    ]
+    for idx, (title, thumb_key, index_key) in enumerate(specs):
+        graph_y = y0 + idx * (graph_h + graph_gap)
+        if graph_y + graph_h + 4 > panel.shape[0]:
+            break
+        draw_multi_graph(
+            panel,
+            16,
+            graph_y,
+            graph_w,
+            graph_h,
+            title,
+            [
+                ("PAL", list(finger_history.get(thumb_key, [])), thumb_color),
+                ("KAZ", list(finger_history.get(index_key, [])), index_color),
+            ],
+            smooth_window,
+        )
+    cv2.putText(panel, f"fps={fps:.1f}  smooth={smooth_window}", (16, panel.shape[0] - 14), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (170, 175, 185), 1, cv2.LINE_AA)
+
+
 def compose_frame(
     frame: np.ndarray,
     calibration: BoardCalibration,
@@ -221,6 +350,7 @@ def compose_frame(
     smoothed_center: Optional[Tuple[float, float]],
     trail: Sequence[Tuple[int, int]],
     history: Dict[str, Deque[float]],
+    finger_history: Dict[str, Deque[float]],
     fps: float,
     smooth_window: int,
     activation_roi: Optional[ActivationRegion] = None,
@@ -243,12 +373,13 @@ def compose_frame(
     if show_trial_status:
         draw_trial_status(annotated, trial_info)
     draw_measurement_timer(annotated, measurement_started, measurement_completed, measurement_time_s, y=118 if show_trial_status else 88)
-    draw_landmark_metrics(annotated, landmark_metrics)
     draw_field_regions(annotated, field_regions or [], hand_field_zone)
     if peg_detector is not None and peg_info is not None and getattr(peg_info, "measurement_active", False):
         peg_detector.draw(annotated, peg_info)
     draw_trail(annotated, trail)
     draw_hand(annotated, observation, smoothed_center)
-    panel = np.zeros((annotated.shape[0], PANEL_WIDTH, 3), dtype=np.uint8)
-    draw_timeseries_panel(panel, history, fps, smooth_window)
-    return cv2.hconcat([annotated, panel])
+    left_panel = np.zeros((annotated.shape[0], PANEL_WIDTH, 3), dtype=np.uint8)
+    right_panel = np.zeros((annotated.shape[0], PANEL_WIDTH, 3), dtype=np.uint8)
+    draw_finger_panel(left_panel, finger_history, landmark_metrics, fps, smooth_window)
+    draw_timeseries_panel(right_panel, history, fps, smooth_window)
+    return cv2.hconcat([left_panel, annotated, right_panel])
