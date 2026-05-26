@@ -79,7 +79,7 @@
 % Naslovnica
 \def\maketitle{\clearpage\thispagestyle{empty}
 
-\@topnewpage[\vbox to 0pt{\offinterlineskip\vss\hbox{\footnotesize\scshape \@ArtJournalText 78(x): \pageref{start}--\pageref{finish}, 2011}\vskip.5mm\hbox{\footnotesize\scshape Existing separate English edition}\vskip4mm}
+\@topnewpage[
 \vskip10mm
 \vbox{\hsize=145mm
 \begin{raggedright}
@@ -90,9 +90,6 @@
 {{\small\bf\@AbstractText}\small\@abstract}\\[2mm]
 {{\small\bf \@KeyWordsText}{\small\@keywords}}\\[5mm]
 }]
-%\vskip5mm}] %peter 10mm -> 5mm
-\footnotetext{\hspace*{-1.8em}\it\@ArtRecText\@received\\
-	      \@ArtRevText\@review}
 }
 
 \def\footnoterule{\kern-3\p@

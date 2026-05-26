@@ -17,10 +17,9 @@
 
 \title{Avtomatska analiza testa devetih zatičev z robotskim vidom}
 
-\authors{Jakob C.}
+\authors{Jakob Čehovin}
 
-\address{Univerza v Ljubljani, Fakulteta za elektrotehniko, Tržaška 25, 1000 Ljubljana, Slovenija\\
-E-pošta: --}
+\address{Univerza v Ljubljani, Fakulteta za elektrotehniko, Tržaška 25, 1000 Ljubljana, Slovenija}
 
 \abstract{Test devetih zatičev je uveljavljen preizkus fine spretnosti roke, pri katerem je poleg skupnega časa izvedbe pomembna tudi kakovost gibanja. V članku je opisan sistem za avtomatsko analizo testa iz enega videoposnetka. Rešitev najprej kalibrira merilno površino iz geometrije dveh mrež lukenj, nato s knjižnico MediaPipe zaznava roko in prstne značilke, sledi izbrani roki skozi čas ter slikovne koordinate pretvori v ravninske metrične koordinate. Iz tako dobljenih trajektorij se izračunajo kumulativna pot, hitrost in pospešek središča roke, dodatno pa še enaki parametri za palec in kazalec. Za začetek merjenja časa se uporabi zaporedje LED polj: najprej svetita obe strani, nato obe ugasneta, nato se prižge ena ciljna stran. Obravnavana je tudi eksperimentalna zaznava odlaganja zatiča na podlagi spremembe videza območja luknje, pri čemer je posebej izpostavljena njena odvisnost od osvetlitve, zakritij in senc.}
 
@@ -29,7 +28,7 @@ E-pošta: --}
 \received{}
 \review{}
 
-\markboth{Jakob C.}{Avtomatska analiza testa devetih zatičev}
+\markboth{Jakob Čehovin}{Avtomatska analiza testa devetih zatičev}
 
 \maketitle
 \IEEEpeerreviewmaketitle
@@ -41,7 +40,7 @@ E-pošta: --}
 
 Test devetih zatičev je klinično uporabljen preizkus fine motorične spretnosti roke. Preiskovanec zatiče zaporedoma prestavlja med poljem za zatiče in poljem z luknjami, pri čemer se običajno meri skupni čas izvedbe. Takšna ročna meritev je preprosta in uporabna, vendar o gibanju pove le malo: ne poda dolžine poti, hitrosti, pospeškov, sprememb v prijemu ali trenutkov, ko se roka približa posameznemu polju. Pri analizi rehabilitacije, primerjavi izvedb ali vrednotenju motoričnih strategij je zato smiselna avtomatizacija iz videoposnetka.
 
-Cilj obravnavane rešitve je iz enega pogleda kamere določiti časovni potek gibanja roke pri testu devetih zatičev. Sistem mora zaznati oziroma segmentirati roko in prste, izbrano roko slediti skozi čas ter iz zaporedja položajev izračunati pot, hitrost in pospešek. Ker je na posnetku vidna merilna površina, se slikovne koordinate lahko preslikajo v ravninske realne enote. To omogoča neposredno interpretacijo grafov v milimetrih in ne le v slikovnih pikah.
+Cilj obravnavane rešitve je iz enega pogleda kamere določiti časovni potek gibanja roke pri testu devetih zatičev. Sistem mora zaznati oziroma segmentirati roko in prste, izbrano roko slediti skozi čas ter iz zaporedja položajev izračunati pot, hitrost in pospešek. Ker je na posnetku vidna merilna površina, se slikovne koordinate lahko preslikajo v ravninske realne enote. To omogoča neposredno interpretacijo grafov v milimetrih.
 
 Razvita rešitev združuje koncepte iz robotskega vida: kalibracijo ravnine, geometrijske preslikave, lokalna območja zanimanja, sledenje gibanja, časovno glajenje in pragovno odločanje. Osnovno jedro sistema je kinematična analiza središča roke, dodatno pa se ločeno obravnavata palec in kazalec, ker sta pri prijemu zatiča najbolj informativna. Za zanesljiv začetek merjenja časa se uporablja zaporedje LED polj na merilni površini. Zaznava odloženega zatiča je vključena kot eksperimentalna funkcionalnost, saj temelji na spremembi videza luknje in zato ni enako robustna kot časovna zaznava iz LED sekvence.
 
@@ -49,7 +48,7 @@ Razvita rešitev združuje koncepte iz robotskega vida: kalibracijo ravnine, geo
 
 \subsection{Kalibracija merilne površine}
 
-Prvi korak obdelave je določitev geometrije merilne površine. Na sliki sta vidni dve mreži velikosti $3 \times 3$, ki vsebujeta luknje oziroma LED območja. Sistem v začetnih okvirjih poišče kandidatne krožne strukture, iz njih sestavi dve pravilni mreži ter iz njune lege določi ravnino plošče. Za stabilnejše delovanje se ne uporabi nujno prvi okvir, temveč se pregleda več začetnih okvirjev in izbere tisti, pri katerem sta mreži najbolje zaznani.
+Prvi korak obdelave je določitev geometrije merilne površine. Na sliki sta vidni dve mreži velikosti $3 \times 3$, ki vsebujeta luknje oziroma LED območja. Sistem v začetnih okvirjih videoposnetka poišče kandidatne krožne strukture, iz njih sestavi dve pravilni mreži ter iz njune lege določi ravnino plošče. Za stabilnejše delovanje se ne uporabi nujno prvi okvir, temveč se pregleda več začetnih okvirjev in izbere tisti, pri katerem sta mreži najbolje zaznani.
 
 Iz kalibracijskih točk se določijo območja zanimanja: območje celotne plošče, začetno območje za zaklep aktivne roke, levo in desno polje lukenj ter lokalne okolice posameznih lukenj. Ta območja se uporabljajo pri sledenju roke, zaznavi LED sekvence in eksperimentalni zaznavi zatičev. Ker gre za en pogled kamere, je uporabljena ravninska projektivna preslikava. To pomeni, da se točka v sliki $\mathbf{p}_{\mathrm{slika}}=(u,v,1)^T$ preslika v koordinato na plošči z
 \begin{equation}
@@ -92,9 +91,9 @@ Enak postopek se uporabi za središče roke, palec in kazalec. Pri palcu in kaza
 
 \subsection{Začetek meritve časa}
 
-Začetek testa se določi z zaznavo LED sekvence na obeh $3 \times 3$ poljih. Stroj stanj najprej zahteva stabilno stanje, v katerem svetita obe strani, nato stabilno ugasnitev obeh strani, na koncu pa stabilno prižgano samo eno stran. Šele tretje stanje določi ciljno stran in začetek merjenja časa. Takšna sekvenčna odločitev je robustnejša od enega samega praga svetlosti, ker kratki utripi, sence ali spremembe osvetlitve ne zadoščajo za začetek meritve.
+Začetek testa se določi z zaznavo LED sekvence na obeh $3 \times 3$ poljih. Program najprej zahteva stabilno stanje, v katerem svetita obe strani, nato stabilno ugasnitev obeh strani, na koncu pa stabilno prižgano samo eno stran. Šele tretje stanje določi ciljno stran in začetek merjenja časa. Takšna sekvenčna odločitev je robustnejša od enega samega praga svetlosti, ker kratki utripi, sence ali spremembe osvetlitve ne zadoščajo za začetek meritve.
 
-Namesto širokega območja polovice slike se pri uspešni kalibraciji uporabijo lokalna območja okoli devetih lukenj na vsaki strani. Za vsako lokacijo se primerja notranji del luknje z neposredno okolico, zato odločitev ni odvisna samo od absolutne svetlosti slike. Kljub temu ostane metoda občutljiva na močne odseve in velike spremembe osvetlitve, zato se zahteva več zaporednih okvirjev z istim stanjem.
+Namesto širokega območja polovice slike se pri uspešni kalibraciji uporabijo lokalna območja okrog devetih lukenj na vsaki strani. Za vsako lokacijo se primerja notranji del luknje z neposredno okolico, zato odločitev ni odvisna samo od absolutne svetlosti slike. Kljub temu ostane metoda občutljiva na močne odseve in velike spremembe osvetlitve, zato se zahteva več zaporednih okvirjev z istim stanjem.
 
 \subsection{Eksperimentalna zaznava zatičev}
 
@@ -104,7 +103,6 @@ Ta pristop je uporaben kot dokaz koncepta, vendar ni popolnoma zanesljiv. Zatič
 
 \section{Rezultati}
 
-Rezultati so prikazani na reprezentativnem posnetku, pri katerem je bila kalibracija uspešna, vidna je bila LED sekvenca, roka pa je večino časa ostala sledljiva. Sistem je obdelal 836 okvirjev pri frekvenci 25 slik/s. Roka je bila zaznana v 83,5 \% okvirjev. Začetek meritve je bil določen pri 116. okvirju, kar ustreza približno 4,64 s od začetka posnetka. Ciljna stran je bila desna, meritev pa se je zaključila pri 795. okvirju; ocenjeni čas izvedbe je bil 27,16 s.
 
 \begin{figure*}[t]
 \begin{center}
@@ -119,7 +117,7 @@ Rezultati so prikazani na reprezentativnem posnetku, pri katerem je bila kalibra
 \includegraphics[width=\linewidth]{fig/article/hand_landmarks_frame.png}\\
 (b) Zaznane značilke roke, palca in kazalca.
 \end{minipage}
-\caption{Primer obdelanega videookvirja. Kalibracija določi ploščo, mreži lukenj in lokalna območja zanimanja, MediaPipe pa poda strukturirane točke roke.}
+\caption{Primer obdelane slike v videu. Kalibracija določi ploščo, mreži lukenj in lokalna območja zanimanja, MediaPipe pa poda strukturirane točke roke.}
 \label{fig:frames}
 \end{center}
 \end{figure*}
@@ -146,7 +144,7 @@ Slika \ref{fig:fingerkin} prikazuje dodatni podizziv: ločeno kinematiko palca i
 
 \subsection{Skupinska primerjava poti palca in kazalca}
 
-Za dodatno oceno prijema smo na desetih posnetkih treh oseb ločeno izračunali kumulativno pot konice palca in konice kazalca. V študiji so bili uporabljeni posnetki pacientov 007, 009 in 010. Obe točki sta bili vzeti neposredno iz modela MediaPipe Hands, nato pa sta bili s homografijo iz kalibrirane mreže 3x3 pretvorjeni v metrični koordinatni sistem. Razlika je bila normalizirana glede na pot palca:
+Za dodatno oceno prijema je bila na desetih posnetkih treh oseb ločeno izračunana kumulativna pot konice palca in konice kazalca. V študiji so bili uporabljeni posnetki pacientov 007, 009 in 010. Obe točki sta bili vzeti neposredno iz modela MediaPipe Hands, nato pa sta bili iz kalibrirane mreže 3x3 pretvorjeni v metrični koordinatni sistem. Razlika je bila normalizirana glede na pot palca:
 \begin{equation}
     r = 100 \frac{s_k - s_p}{s_p},
 \end{equation}
@@ -197,13 +195,14 @@ Za informativno preverjanje trajanja poskusa so bili avtomatsko izmerjeni časi 
 
 Na sliki \ref{fig:peg} je prikazan primer eksperimentalne zaznave zatičev. Na tem posnetku je metoda sledila postopnemu naraščanju števila zaznanih zatičev in dosegla vrednost osem, vendar ta rezultat ne pomeni splošne robustnosti. Delovanje je odvisno od stabilnosti osvetlitve, vidnosti lukenj in tega, ali roka po odlaganju dovolj jasno zapusti ciljno polje.
 
+
 \section{Razprava}
 
 Največja prednost uporabe MediaPipe je strukturirana zaznava roke brez ročne segmentacije kože. Sistem dobi položaje prstov, zapestja in celotne dlani tudi v primerih, ko je ozadje kompleksno. To omogoča neposredno kinematično analizo palca in kazalca, ki bi bila z običajnimi barvnimi pragovi precej težja. Slabost takega pristopa je, da je rezultat odvisen od naučenega modela in kakovosti posnetka. Pri delnem izhodu roke iz kadra, močnih zakritjih ali nenavadnih položajih prstov se zaznava lahko izgubi.
 
 Poseben problem je preskok zaznave na drugo roko. Če sta v kadru obe roki, lahko model v posameznem okvirju poda višjo zanesljivost za napačno roko. Zato je pomembno, da sledenje ne temelji samo na oznaki leve ali desne roke, temveč na kontinuiteti položaja, lokalnem gibanju in območju merilne plošče. Mehka omejitev območja zanimanja je pri tem kompromis: preprečuje nenadne preskoke na oddaljeno roko, hkrati pa ne prekine sledi takoj, ko roka delno zapusti območje.
 
-Vpliv osvetlitve je dvojen. Pri LED sekvenci so svetlobne spremembe namerni signal in se pojavljajo na znanih mestih, zato je mogoče uporabiti lokalne primerjave in stroj stanj. Zaznava začetka je zato razmeroma robustna. Pri zatičih pa sprememba ni tako izrazita: zatič je majhen, njegova barva se lahko zlije z okolico, luknjo lahko zakrije senca ali prst, odsev na plošči pa lahko povzroči podobno spremembo kot dejanska prisotnost zatiča. Zato zaznava zatiča v luknji ostane manj zanesljiva in mora biti predstavljena kot eksperimentalna.
+Pri LED sekvenci so svetlobne spremembe namerni signal in se pojavljajo na znanih mestih, zato je mogoče uporabiti lokalne primerjave. Zaznava začetka je zato razmeroma robustna. Pri zatičih pa sprememba ni tako izrazita: zatič je majhen, njegova barva se lahko zlije z okolico, luknjo lahko zakrije senca ali prst, odsev na plošči pa lahko povzroči podobno spremembo kot dejanska prisotnost zatiča. Zato zaznava zatiča v luknji ostane manj zanesljiva in mora biti predstavljena kot eksperimentalna.
 
 Primerjava z ročnimi meritvami dodatno pokaže, da je za klinično uporabno meritev najpomembnejša robustna zaznava konca. Avtomatska meritev je bila v analiziranem vzorcu v povprečju daljša od ročne, kar je skladno s tem, da algoritem ne zaključi meritve ob prvem možnem znaku konca, temveč zahteva stabilno stanje ciljnega polja. Takšna zahteva zmanjša možnost prezgodnjega zaključka, vendar lahko poveča izmerjeni čas.
 
@@ -211,9 +210,9 @@ Omejitev enega pogleda kamere je, da sistem meri le projekcijo gibanja na ravnin
 
 \section{Zaključek}
 
-Predstavljena rešitev omogoča avtomatsko analizo gibanja roke pri testu devetih zatičev iz enega videoposnetka. Glavni prispevki so kalibracija merilne površine, zaznava in sledenje roke z MediaPipe, pretvorba koordinat v realne ravninske enote ter izračun poti, hitrosti in pospeška. Poleg središča roke se ločeno analizirata palec in kazalec, kar bolje opiše gibanje prijema. Začetek merjenja časa je določen z LED sekvenco in je zato zanesljivejši od neposrednega ugibanja začetka iz položaja roke.
+Predstavljena rešitev omogoča avtomatsko analizo gibanja roke pri testu devetih zatičev iz enega videoposnetka. Glavni prispevki so kalibracija merilne površine, zaznava in sledenje roke z MediaPipe, pretvorba koordinat v realne ravninske enote ter izračun poti, hitrosti in pospeška. Poleg središča roke se ločeno analizirata palec in kazalec, kar omogoča podrobnejši opis gibanja pri prijemu in odlaganju zatičev. Začetek merjenja časa je določen z LED sekvenco, zato je zanesljivejši od neposrednega določanja začetka iz položaja roke.
 
-Nadaljnje izboljšave naj se osredotočijo na robustnejše vzdrževanje identitete izbrane roke, kombiniranje več signalov pri zaznavi odloženega zatiča, vrednotenje na večjem številu videoposnetkov in primerjavo z referenčnimi meritvami. Za natančnejšo prostorsko analizo bi bilo smiselno uporabiti dodatni pogled kamere ali globinsko informacijo, s čimer bi se zmanjšala omejitev ravninske projekcije.
+Nadaljnje izboljšave bi se lahko osredotočile na robustnejše vzdrževanje identitete izbrane roke in na kombiniranje več slikovnih signalov pri zaznavi odloženega zatiča. Pomembna nadgradnja bi bila tudi uporaba vseh treh razpoložljivih kamer. Z združevanjem informacij iz treh pogledov bi bilo mogoče rekonstruirati tridimenzionalni model gibanja roke, s čimer bi se bolje opisala dejanska prostorska pot roke in prstov, ne le njena projekcija na ravnino merilne plošče. Tak pristop bi omogočil tudi zanesljivejše zaznavanje nepravilnosti med izvedbo testa, na primer odstopanj v prijemu, dvigu roke, približevanju luknjam in drugih napak, ki jih preiskovanec naredi med opravljanjem naloge.
 
 \begin{thebibliography}{3}
 \bibitem{mathiowetz}
@@ -223,7 +222,11 @@ V.~Mathiowetz, K.~Weber, G.~Kashman in G.~Volland, ``Adult norms for the Nine Ho
 C.~Lugaresi et al., ``MediaPipe: A framework for building perception pipelines,'' {\em arXiv preprint arXiv:1906.08172}, 2019.
 
 \bibitem{rvgradivo}
-Ž.~Špiclin, {\em Robotski vid: predavanja in laboratorijske vaje}. Fakulteta za elektrotehniko, Univerza v Ljubljani.
+Ž.~Špiclin, \emph{Robotski vid: Priročnik za laboratorijske vaje}.
+Ljubljana: Založba FE, Fakulteta za elektrotehniko, Univerza v Ljubljani, 2025.
+ISBN: 978-961-243-479-3. Dostopno: https://lit.fe.uni-lj.si/gradivo/RobotskiVid-PrirocnikZaVaje.pdf
+
+
 \end{thebibliography}
 
 \vfill

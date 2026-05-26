@@ -1,6 +1,7 @@
 import argparse
 import json
 import math
+import subprocess
 import sys
 from collections import deque
 from pathlib import Path
@@ -14,9 +15,6 @@ import pandas as pd
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
-
-from track_calibrated_hand_and_pins import parse_args as parse_pipeline_args
-from track_calibrated_hand_and_pins import process_video
 
 
 SIDE_VALUES = ("auto", "left", "right")
@@ -33,6 +31,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--target-side", choices=SIDE_VALUES, default="auto", help="Only this board side should receive pins.")
     parser.add_argument("--max-frames", type=int, default=0, help="0 means full video.")
     parser.add_argument("--frame-samples", type=int, default=120)
+    parser.add_argument("--rotate-clockwise", action="store_true", help="Rotate input video before processing.")
+    parser.add_argument("--calibration-input", default="", help="Optional existing calibration JSON for the tracker.")
     parser.add_argument("--show", action="store_true", help="Show base tracker window while tracking.")
     parser.add_argument("--show-final", action="store_true", help="Show final quick-check video while it is written.")
     parser.add_argument("--skip-tracker", action="store_true", help="Reuse an existing tracker CSV/video in output-root.")
@@ -53,38 +53,48 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def build_pipeline_args(args: argparse.Namespace) -> argparse.Namespace:
-    pipeline_args = parse_pipeline_args([])
-    pipeline_args.video = args.video
-    pipeline_args.output_root = args.output_root
-    pipeline_args.output_stem = args.output_stem
-    pipeline_args.max_frames = args.max_frames
-    pipeline_args.frame_samples = args.frame_samples
-    pipeline_args.show = args.show
-
-    pipeline_args.disable_pins = False
-    pipeline_args.velocity_center_source = "ma"
-    pipeline_args.ma_window = args.ma_window
-    pipeline_args.velocity_window_frames = args.velocity_window_frames
-    pipeline_args.acceleration_window_frames = args.acceleration_window_frames
-    pipeline_args.speed_ema_alpha = args.speed_ema_alpha
-    pipeline_args.max_hand_speed_mm_s = args.max_hand_speed_mm_s
-    pipeline_args.max_acceleration_mm_s2 = args.max_acceleration_mm_s2
-    pipeline_args.output_stem = args.output_stem
-    if args.expected_hand in {"left", "right"}:
-        pipeline_args.active_side = args.expected_hand
-    return pipeline_args
-
-
 def output_paths(output_root: Path, output_stem: str) -> Dict[str, Path]:
     return {
         "tracker_video": output_root / f"{output_stem}_preview.avi",
         "tracker_csv": output_root / f"{output_stem}.csv",
+        "tracker_calibration": output_root / f"{output_stem}_calibration.json",
         "live_video": output_root / f"{output_stem}_live_check.avi",
         "check_csv": output_root / f"{output_stem}_check.csv",
         "check_json": output_root / f"{output_stem}_check_summary.json",
         "check_txt": output_root / f"{output_stem}_check_report.txt",
     }
+
+
+def run_tracker(args: argparse.Namespace, paths: Dict[str, Path]) -> None:
+    command = [
+        sys.executable,
+        str(PROJECT_ROOT / "final" / "run_hand_pipeline.py"),
+        "--input",
+        str(args.video),
+        "--output",
+        str(paths["tracker_video"]),
+        "--csv-output",
+        str(paths["tracker_csv"]),
+        "--calibration-scan-frames",
+        str(max(1, int(args.frame_samples))),
+        "--max-frames",
+        str(max(0, int(args.max_frames))),
+        "--smooth-window",
+        str(max(1, int(args.ma_window))),
+        "--smooth-alpha",
+        str(float(args.speed_ema_alpha)),
+        "--peg-detection",
+        "on",
+    ]
+    if args.calibration_input:
+        command.extend(["--calibration-input", str(args.calibration_input)])
+    else:
+        command.extend(["--calibration-output", str(paths["tracker_calibration"])])
+    if args.rotate_clockwise:
+        command.append("--rotate-clockwise")
+    if args.show:
+        command.append("--show")
+    subprocess.run(command, check=True)
 
 
 def finite_or_zero(value: object) -> float:
@@ -139,6 +149,12 @@ def side_activity_score(df: pd.DataFrame, hole_sides: Dict[int, str], side: str)
 def infer_target_side(df: pd.DataFrame, hole_sides: Dict[int, str], requested_side: str) -> str:
     if requested_side in {"left", "right"}:
         return requested_side
+    for column in ("measurement_target_side", "trial_side", "peg_target_side"):
+        if column in df.columns:
+            values = df[column].dropna().astype(str).str.lower()
+            values = values[values.isin(["left", "right"])]
+            if not values.empty:
+                return str(values.iloc[-1])
     left_score = side_activity_score(df, hole_sides, "left")
     right_score = side_activity_score(df, hole_sides, "right")
     if left_score == 0 and right_score == 0 and "hand_x_mm" in df.columns:
@@ -179,6 +195,10 @@ def side_frame_counts(row: pd.Series, hole_sides: Dict[int, str]) -> Dict[str, D
         "left": {"occupied": 0, "pin_near": 0, "interaction": 0},
         "right": {"occupied": 0, "pin_near": 0, "interaction": 0},
     }
+    if not hole_sides:
+        for side in ("left", "right"):
+            counts[side]["occupied"] = int(finite_or_zero(row.get(f"peg_{side}_count")))
+        return counts
     for idx, side in hole_sides.items():
         counts[side]["occupied"] += int(finite_or_zero(row.get(f"hole_{idx:02d}_occupied")) > 0.5)
         counts[side]["pin_near"] += int(finite_or_zero(row.get(f"hole_{idx:02d}_pin_near")) > 0.5)
@@ -200,11 +220,13 @@ def build_check_table(
     args: argparse.Namespace,
 ) -> pd.DataFrame:
     check = pd.DataFrame()
-    check["frame"] = df["frame"].astype(int)
+    frame_column = "frame_idx" if "frame_idx" in df.columns else "frame"
+    check["frame"] = df[frame_column].astype(int)
     check["time_s"] = pd.to_numeric(df["time_s"], errors="coerce").fillna(0)
     check["hand_detected"] = pd.to_numeric(df.get("hand_detected", 0), errors="coerce").fillna(0).astype(int)
     check["speed_raw_mm_s"] = pd.to_numeric(df.get("speed_mm_s", np.nan), errors="coerce")
-    check["speed_ema_mm_s"] = pd.to_numeric(df.get("speed_ema_mm_s", np.nan), errors="coerce")
+    speed_smooth = df.get("speed_ema_mm_s", df.get("speed_mm_s_smooth", df.get("speed_mm_s", np.nan)))
+    check["speed_ema_mm_s"] = pd.to_numeric(speed_smooth, errors="coerce")
     check["speed_final_mm_s"] = smoothed_series(check["speed_ema_mm_s"], args.display_speed_alpha)
 
     brightness_flags, brightness = compute_brightness_flags(video_path, len(df), args.brightness_jump_threshold)
@@ -219,8 +241,9 @@ def build_check_table(
         missing_flags.append(int(float(time_s) - last_seen_time >= args.missing_hand_seconds))
     check["missing_hand_warning"] = missing_flags
 
-    if "selected_handedness" in df.columns and expected_hand in {"left", "right"}:
-        labels = df["selected_handedness"].fillna("").astype(str).str.lower()
+    handedness_column = "selected_handedness" if "selected_handedness" in df.columns else "active_hand_label"
+    if handedness_column in df.columns and expected_hand in {"left", "right"}:
+        labels = df[handedness_column].fillna("").astype(str).str.lower()
         check["wrong_hand_warning"] = (
             (check["hand_detected"] == 1)
             & labels.isin(["left", "right"])
@@ -450,7 +473,7 @@ def main() -> None:
     video_path = Path(args.video)
 
     if not args.skip_tracker:
-        process_video(build_pipeline_args(args))
+        run_tracker(args, paths)
 
     if not paths["tracker_csv"].exists():
         raise FileNotFoundError(f"Missing tracker CSV: {paths['tracker_csv']}")
