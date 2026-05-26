@@ -55,6 +55,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--peg-detection", choices=["on", "off"], default="on", help="Detect inserted pegs from stable local changes around calibrated 3x3 holes.")
     parser.add_argument("--peg-stable-frames", type=int, default=5, help="Stable frames needed before a peg hole changes occupied/empty state.")
     parser.add_argument("--peg-change-threshold", type=float, default=0.32, help="Local patch-change threshold for peg occupancy.")
+    parser.add_argument("--trial-end-peg-threshold", type=int, default=8, help="Target peg count that must be reached before an empty target field can stop the trial timer.")
+    parser.add_argument("--trial-end-empty-frames", type=int, default=5, help="Consecutive stable empty target-field frames needed to stop the trial timer.")
+    parser.add_argument("--trial-end-min-visible", type=int, default=7, help="Minimum visible target holes needed before an empty field can stop the trial timer.")
     parser.add_argument("--light-delta-threshold", type=float, default=22.0, help="Brightness increase over baseline needed to mark a light field as on.")
     parser.add_argument("--light-side-gap-threshold", type=float, default=1.0, help="Minimum baseline-relative brightness gap between sides when deciding which single side is on.")
     parser.add_argument("--both-light-frames", type=int, default=3, help="Stable frames needed for the initial both-fields-on event.")
@@ -130,6 +133,24 @@ def covered_sides_from_hand_field(hand_field_zone: str) -> set:
     return set()
 
 
+def peg_target_count(peg_info) -> int:
+    target_side = str(getattr(peg_info, "target_side", ""))
+    states = getattr(peg_info, "states", {}).get(target_side, []) if target_side else []
+    return int(sum(int(value) for value in states))
+
+
+def peg_target_visible_count(peg_info) -> int:
+    target_side = str(getattr(peg_info, "target_side", ""))
+    visible = getattr(peg_info, "visible", {}).get(target_side, []) if target_side else []
+    return int(sum(int(value) for value in visible))
+
+
+def peg_target_covered(peg_info) -> bool:
+    target_side = str(getattr(peg_info, "target_side", ""))
+    covered = getattr(peg_info, "covered", {})
+    return bool(target_side and covered.get(target_side, False))
+
+
 def empty_kinematics_row(path_length: float = 0.0) -> Dict[str, float]:
     return {
         "hand_center_x": float("nan"),
@@ -149,6 +170,9 @@ def build_row(
     frame_idx: int,
     time_s: float,
     measurement_started: bool,
+    measurement_running: bool,
+    measurement_completed: bool,
+    measurement_end_frame: int,
     measurement_time_s: float,
     observation,
     kin: Dict[str, float],
@@ -176,6 +200,9 @@ def build_row(
         "frame_idx": int(frame_idx),
         "time_s": float(time_s),
         "measurement_started": int(measurement_started),
+        "measurement_running": int(measurement_running),
+        "measurement_completed": int(measurement_completed),
+        "measurement_end_frame": int(measurement_end_frame) if measurement_end_frame >= 0 else np.nan,
         "measurement_time_s": float(measurement_time_s) if np.isfinite(measurement_time_s) else np.nan,
         "hand_detected": int(observation.detected),
         "track_started": int(observation.track_started),
@@ -244,11 +271,19 @@ def print_summary(
     trial_started = bool("trial_started" in df and pd.to_numeric(df["trial_started"], errors="coerce").fillna(0).max() > 0)
     trial_side = ""
     trial_start_frame = np.nan
+    measurement_completed = bool("measurement_completed" in df and pd.to_numeric(df["measurement_completed"], errors="coerce").fillna(0).max() > 0)
+    measurement_end_frame = np.nan
+    measurement_elapsed_s = np.nan
     if trial_started:
         started_rows = df[pd.to_numeric(df["trial_started"], errors="coerce").fillna(0) > 0]
         if not started_rows.empty:
             trial_side = str(started_rows["trial_side"].iloc[-1]) if "trial_side" in started_rows else ""
             trial_start_frame = pd.to_numeric(started_rows["trial_start_frame"], errors="coerce").dropna().min()
+    if measurement_completed:
+        completed_rows = df[pd.to_numeric(df["measurement_completed"], errors="coerce").fillna(0) > 0]
+        if not completed_rows.empty:
+            measurement_end_frame = pd.to_numeric(completed_rows["measurement_end_frame"], errors="coerce").dropna().min()
+            measurement_elapsed_s = pd.to_numeric(completed_rows["measurement_time_s"], errors="coerce").dropna().min()
 
     print("\nFinal hand pipeline summary")
     print(f"  input video: {args.input}")
@@ -264,6 +299,9 @@ def print_summary(
     print(f"  trial_started: {trial_started}")
     print(f"  trial_side: {trial_side}")
     print(f"  trial_start_frame: {trial_start_frame}")
+    print(f"  measurement_completed: {measurement_completed}")
+    print(f"  measurement_end_frame: {measurement_end_frame}")
+    print(f"  measurement_elapsed_s: {measurement_elapsed_s}")
     print(f"  total_path_length_px: {total_path:.3f}")
     print(f"  mean_speed_px_s: {float(speed.mean()) if not speed.empty else np.nan:.3f}")
     print(f"  max_speed_px_s: {float(speed.max()) if not speed.empty else np.nan:.3f}")
@@ -355,8 +393,12 @@ def main() -> None:
         "thumb_index": deque(maxlen=360),
     }
     rows: List[Dict[str, object]] = []
-    measurement_active = bool(args.measure_from == "immediate" or trial_detector is None)
-    measurement_start_frame = 0 if measurement_active else -1
+    measurement_started = bool(args.measure_from == "immediate" or trial_detector is None)
+    measurement_completed = False
+    measurement_start_frame = 0 if measurement_started else -1
+    measurement_end_frame = -1
+    max_target_peg_count = 0
+    empty_target_frames = 0
     show_ok = bool(args.show)
     if show_ok:
         try:
@@ -379,20 +421,25 @@ def main() -> None:
             activation_roi = tracker.get_activation_roi(frame.shape, calibration.board_roi, start_activation_roi)
             observation = tracker.detect(frame, calibration.board_roi, start_activation_roi, tracking_roi)
             hand_field_zone, hand_field_counts = hand_field_contact(observation, field_regions)
-            if not measurement_active and trial_info is not None and bool(getattr(trial_info, "trial_started", False)):
-                measurement_active = True
+            if not measurement_started and trial_info is not None and bool(getattr(trial_info, "trial_started", False)):
+                measurement_started = True
                 measurement_start_frame = int(frame_idx)
+                measurement_end_frame = -1
+                measurement_completed = False
+                max_target_peg_count = 0
+                empty_target_frames = 0
                 kinematics.reset()
                 trail.clear()
                 for values in history.values():
                     values.clear()
 
+            measurement_running = bool(measurement_started and not measurement_completed)
             measurement_time_s = (
-                max(0.0, (float(frame_idx) - float(measurement_start_frame)) / fps)
-                if measurement_active and measurement_start_frame >= 0
+                max(0.0, (float(measurement_end_frame if measurement_completed else frame_idx) - float(measurement_start_frame)) / fps)
+                if measurement_started and measurement_start_frame >= 0
                 else float("nan")
             )
-            if measurement_active:
+            if measurement_running:
                 kin = kinematics.update(measurement_time_s, observation.detected, observation.center_raw, observation.thumb_index_distance_px)
             else:
                 kin = empty_kinematics_row()
@@ -403,20 +450,55 @@ def main() -> None:
                     frame,
                     covered_sides=covered_sides_from_hand_field(hand_field_zone),
                     target_side=target_side,
-                    measurement_active=measurement_active,
+                    measurement_active=measurement_started,
                 )
+                if measurement_running and target_side:
+                    target_count = peg_target_count(peg_info)
+                    max_target_peg_count = max(max_target_peg_count, target_count)
+                    end_candidate = bool(
+                        max_target_peg_count >= int(args.trial_end_peg_threshold)
+                        and target_count == 0
+                        and not peg_target_covered(peg_info)
+                        and peg_target_visible_count(peg_info) >= int(args.trial_end_min_visible)
+                    )
+                    if end_candidate:
+                        empty_target_frames += 1
+                    else:
+                        empty_target_frames = 0
+                    if empty_target_frames >= int(args.trial_end_empty_frames):
+                        measurement_completed = True
+                        measurement_end_frame = int(frame_idx)
+                        measurement_running = False
+                        measurement_time_s = max(0.0, (float(measurement_end_frame) - float(measurement_start_frame)) / fps)
             smoothed_center = None
-            if measurement_active and np.isfinite(kin["hand_center_x"]) and np.isfinite(kin["hand_center_y"]):
+            if measurement_running and np.isfinite(kin["hand_center_x"]) and np.isfinite(kin["hand_center_y"]):
                 smoothed_center = (float(kin["hand_center_x"]), float(kin["hand_center_y"]))
                 trail.append((int(round(smoothed_center[0])), int(round(smoothed_center[1]))))
 
-            if measurement_active:
+            if measurement_running:
                 history["path"].append(float(kin["path_length_px_cumulative"]))
                 history["speed"].append(float(kin["speed_px_s_smooth"]))
                 history["acceleration"].append(float(kin["acceleration_px_s2_smooth"]))
                 history["thumb_index"].append(float(kin["thumb_index_distance_px_smooth"]))
 
-            rows.append(build_row(frame_idx, time_s, measurement_active, measurement_time_s, observation, kin, calibration, trial_info, hand_field_zone, hand_field_counts, peg_info))
+            rows.append(
+                build_row(
+                    frame_idx,
+                    time_s,
+                    measurement_started,
+                    measurement_running,
+                    measurement_completed,
+                    measurement_end_frame,
+                    measurement_time_s,
+                    observation,
+                    kin,
+                    calibration,
+                    trial_info,
+                    hand_field_zone,
+                    hand_field_counts,
+                    peg_info,
+                )
+            )
             display_frame = frame.copy()
             if args.show_light_zones and trial_detector is not None and trial_info is not None:
                 trial_detector.draw_zones(display_frame, trial_info)
@@ -431,6 +513,9 @@ def main() -> None:
                 args.smooth_window,
                 activation_roi=activation_roi,
                 trial_info=trial_info,
+                measurement_started=measurement_started,
+                measurement_completed=measurement_completed,
+                measurement_time_s=measurement_time_s,
                 show_trial_status=args.show_trial_status,
                 field_regions=field_regions if args.show_field_zones else [],
                 hand_field_zone=hand_field_zone if args.show_field_zones else "",

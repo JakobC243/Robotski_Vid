@@ -95,6 +95,20 @@ def draw_trial_status(image: np.ndarray, trial_info) -> None:
     draw_text(image, text, (15, 88), 0.52, color)
 
 
+def draw_measurement_timer(
+    image: np.ndarray,
+    measurement_started: bool,
+    measurement_completed: bool,
+    measurement_time_s: float,
+    y: int = 88,
+) -> None:
+    if not measurement_started or not np.isfinite(measurement_time_s):
+        return
+    label = "KONEC" if measurement_completed else "CAS"
+    color = (90, 190, 255) if measurement_completed else (80, 255, 130)
+    draw_text(image, f"{label} {measurement_time_s:.2f}s", (15, y), 0.62, color)
+
+
 def draw_field_regions(image: np.ndarray, field_regions: Sequence[Dict], hand_field_zone: str) -> None:
     if not field_regions:
         return
@@ -111,17 +125,6 @@ def draw_field_regions(image: np.ndarray, field_regions: Sequence[Dict], hand_fi
         label = "LEVO" if side == "left" else "DESNO" if side == "right" else side.upper()
         anchor = tuple(np.round(np.mean(polygon, axis=0)).astype(int))
         cv2.putText(image, label, (anchor[0] - 18, anchor[1] + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.40, color, 1, cv2.LINE_AA)
-
-    if hand_field_zone:
-        if hand_field_zone == "left":
-            text = "ROKA LEVO"
-        elif hand_field_zone == "right":
-            text = "ROKA DESNO"
-        elif hand_field_zone == "both":
-            text = "ROKA OBE POLJI"
-        else:
-            text = f"ROKA {hand_field_zone.upper()}"
-        draw_text(image, text, (15, 118), 0.58, (0, 255, 255))
 
 
 def draw_trail(image: np.ndarray, trail: Sequence[Tuple[int, int]]) -> None:
@@ -201,6 +204,9 @@ def compose_frame(
     smooth_window: int,
     activation_roi: Optional[ActivationRegion] = None,
     trial_info=None,
+    measurement_started: bool = False,
+    measurement_completed: bool = False,
+    measurement_time_s: float = float("nan"),
     show_trial_status: bool = False,
     field_regions: Optional[List[Dict]] = None,
     hand_field_zone: str = "",
@@ -212,6 +218,7 @@ def compose_frame(
     draw_activation_roi(annotated, activation_roi)
     if show_trial_status:
         draw_trial_status(annotated, trial_info)
+    draw_measurement_timer(annotated, measurement_started, measurement_completed, measurement_time_s, y=118 if show_trial_status else 88)
     draw_field_regions(annotated, field_regions or [], hand_field_zone)
     if peg_detector is not None and peg_info is not None and getattr(peg_info, "measurement_active", False):
         peg_detector.draw(annotated, peg_info)
