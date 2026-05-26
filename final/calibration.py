@@ -249,6 +249,108 @@ def detect_bright_hole_candidates(
     return points, mask
 
 
+def annulus_values(value: np.ndarray, center: Tuple[float, float], inner_radius: float, outer_radius: float) -> np.ndarray:
+    cx = float(center[0])
+    cy = float(center[1])
+    h, w = value.shape[:2]
+    radius = max(float(inner_radius), float(outer_radius))
+    x0 = int(max(0, np.floor(cx - radius)))
+    x1 = int(min(w, np.ceil(cx + radius + 1.0)))
+    y0 = int(max(0, np.floor(cy - radius)))
+    y1 = int(min(h, np.ceil(cy + radius + 1.0)))
+    if x1 <= x0 or y1 <= y0:
+        return np.asarray([], dtype=np.float32)
+    yy, xx = np.ogrid[y0:y1, x0:x1]
+    dist2 = (xx.astype(np.float32) - cx) ** 2 + (yy.astype(np.float32) - cy) ** 2
+    mask = dist2 <= float(outer_radius) ** 2
+    if inner_radius > 0.0:
+        mask &= dist2 >= float(inner_radius) ** 2
+    return value[y0:y1, x0:x1][mask].astype(np.float32)
+
+
+def detect_dark_hole_candidates(
+    image_bgr: np.ndarray,
+    min_radius: float = 2.6,
+    max_radius: float = 9.5,
+    min_area: float = 13.0,
+    max_area: float = 150.0,
+    min_circularity: float = 0.42,
+    min_local_contrast: float = 9.0,
+) -> Tuple[List[Dict], np.ndarray]:
+    value = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2HSV)[:, :, 2]
+    value_f = value.astype(np.float32)
+    local = cv2.GaussianBlur(value_f, (0, 0), 5.5)
+    dark_response = np.clip(local - value_f, 0.0, 255.0).astype(np.uint8)
+    _, mask = cv2.threshold(dark_response, int(round(min_local_contrast)), 255, cv2.THRESH_BINARY)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((2, 2), np.uint8), iterations=1)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((2, 2), np.uint8), iterations=1)
+
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    points: List[Dict] = []
+    for contour in contours:
+        area = float(cv2.contourArea(contour))
+        if area < min_area or area > max_area:
+            continue
+        perimeter = float(cv2.arcLength(contour, True))
+        if perimeter <= 0:
+            continue
+        circularity = float(4.0 * math.pi * area / (perimeter * perimeter))
+        if circularity < min_circularity:
+            continue
+        (x, y), radius = cv2.minEnclosingCircle(contour)
+        if radius < min_radius or radius > max_radius:
+            continue
+
+        center_vals = annulus_values(value, (x, y), 0.0, max(1.8, 0.70 * radius))
+        ring_vals = annulus_values(value, (x, y), radius + 2.0, max(radius + 4.0, 2.35 * radius))
+        if center_vals.size == 0 or ring_vals.size == 0:
+            continue
+        center_value = float(np.percentile(center_vals, 35))
+        ring_value = float(np.percentile(ring_vals, 60))
+        local_contrast = ring_value - center_value
+        if local_contrast < min_local_contrast:
+            continue
+
+        points.append(
+            {
+                "x": float(x),
+                "y": float(y),
+                "r": float(radius),
+                "area": area,
+                "circularity": circularity,
+                "mean_value": center_value,
+                "local_contrast": float(local_contrast),
+                "polarity": "dark",
+                "score": local_contrast * circularity * area,
+            }
+        )
+    points = merge_close_points(points, merge_dist_px=max(3.5, 1.2 * min_radius))
+    points.sort(key=lambda item: (item["y"], item["x"]))
+    return points, mask
+
+
+def detect_hole_candidates(image_bgr: np.ndarray) -> Tuple[List[Dict], np.ndarray]:
+    bright_points, bright_mask = detect_bright_hole_candidates(image_bgr)
+    dark_points, dark_mask = detect_dark_hole_candidates(image_bgr)
+    points = merge_close_points(bright_points + dark_points, merge_dist_px=4.5)
+    points.sort(key=lambda item: (item["y"], item["x"]))
+    return points, cv2.bitwise_or(bright_mask, dark_mask)
+
+
+def filter_points_to_polygon(points: List[Dict], polygon: Optional[np.ndarray], margin_px: float = 6.0) -> List[Dict]:
+    if polygon is None:
+        return points
+    poly = np.asarray(polygon, dtype=np.float32).reshape(-1, 2)
+    if poly.shape[0] < 3:
+        return points
+    kept = []
+    for point in points:
+        distance = cv2.pointPolygonTest(poly, (float(point["x"]), float(point["y"])), True)
+        if distance >= -float(margin_px):
+            kept.append(point)
+    return kept
+
+
 def cluster_hole_candidates(points: List[Dict], link_distance_px: float = 45.0) -> List[List[int]]:
     if not points:
         return []
@@ -302,16 +404,19 @@ def score_hole_grid(points: np.ndarray, p0: np.ndarray, u: np.ndarray, v: np.nda
     expected_points = []
     matched_points = []
     matched_indices = []
+    matched_local_ids = []
     errors = []
     used = set()
     for row in range(3):
         for col in range(3):
+            local_id = row * 3 + col
             expected = p0 + col * u + row * v
             expected_points.append(expected)
             idx, err = nearest_unused(expected, points, used, tolerance_px)
             if idx is None:
                 continue
             used.add(idx)
+            matched_local_ids.append(local_id)
             matched_indices.append(idx)
             matched_points.append(points[idx])
             errors.append(err)
@@ -334,6 +439,7 @@ def score_hole_grid(points: np.ndarray, p0: np.ndarray, u: np.ndarray, v: np.nda
         "expected_points": np.asarray(expected_points, dtype=np.float32),
         "matched_points": np.asarray(matched_points, dtype=np.float32),
         "matched_indices": matched_indices,
+        "matched_local_ids": matched_local_ids,
     }
 
 
@@ -405,11 +511,137 @@ def select_two_hole_grids(
     return selected
 
 
+def match_expected_holes(
+    expected_points: np.ndarray,
+    points: np.ndarray,
+    tolerance_px: float,
+) -> Tuple[List[int], List[int], List[float]]:
+    matched_local_ids: List[int] = []
+    matched_indices: List[int] = []
+    errors: List[float] = []
+    used = set()
+    for local_id, expected in enumerate(np.asarray(expected_points, dtype=np.float32).reshape(-1, 2)):
+        idx, err = nearest_unused(expected, points, used, tolerance_px)
+        if idx is None:
+            continue
+        used.add(idx)
+        matched_local_ids.append(int(local_id))
+        matched_indices.append(int(idx))
+        errors.append(float(err))
+    return matched_local_ids, matched_indices, errors
+
+
+def infer_missing_grid_from_single_grid(
+    base_grid: Dict,
+    points: List[Dict],
+    frame_width: int,
+    frame_height: int,
+    board_polygon: Optional[np.ndarray] = None,
+    min_matches: int = 3,
+) -> Optional[Dict]:
+    if not points:
+        return None
+    all_points = np.asarray([[p["x"], p["y"]] for p in points], dtype=np.float32)
+    base_expected = np.asarray(base_grid.get("expected_points", []), dtype=np.float32).reshape(-1, 2)
+    if base_expected.shape[0] != 9:
+        return None
+
+    center = np.asarray(base_grid.get("center", np.mean(base_expected, axis=0)), dtype=np.float32)
+    spacing_values = [
+        float(base_grid.get("spacing_u_px", float("nan"))),
+        float(base_grid.get("spacing_v_px", float("nan"))),
+    ]
+    spacing_values = [value for value in spacing_values if np.isfinite(value) and value > 1.0]
+    spacing = float(np.median(spacing_values)) if spacing_values else 24.0
+    if not np.isfinite(spacing) or spacing <= 1.0:
+        return None
+
+    if center[0] < 0.45 * frame_width:
+        signs = [1.0]
+    elif center[0] > 0.55 * frame_width:
+        signs = [-1.0]
+    else:
+        signs = [-1.0, 1.0]
+
+    # Different camera setups see the same 32 mm grid spacing with slightly
+    # different projected center distances between the two 3x3 fields.
+    center_distance_ratios = (8.55, 7.80, 7.35)
+    tolerance = max(8.0, 0.42 * spacing)
+    best: Optional[Dict] = None
+
+    for sign in signs:
+        for ratio in center_distance_ratios:
+            offset = np.asarray([sign * ratio * spacing, 0.0], dtype=np.float32)
+            expected = base_expected + offset.reshape(1, 2)
+            if np.count_nonzero(
+                (expected[:, 0] >= 0.0)
+                & (expected[:, 0] < float(frame_width))
+                & (expected[:, 1] >= 0.0)
+                & (expected[:, 1] < float(frame_height))
+            ) < 7:
+                continue
+            if board_polygon is not None:
+                inside_count = sum(
+                    1
+                    for point in expected
+                    if cv2.pointPolygonTest(
+                        np.asarray(board_polygon, dtype=np.float32).reshape(-1, 2),
+                        (float(point[0]), float(point[1])),
+                        True,
+                    )
+                    >= -max(8.0, 0.40 * spacing)
+                )
+                if inside_count < 7:
+                    continue
+
+            local_ids, matched_indices, errors = match_expected_holes(expected, all_points, tolerance)
+            if len(matched_indices) >= 2:
+                deltas = all_points[matched_indices] - expected[local_ids]
+                refine = np.median(deltas, axis=0).astype(np.float32)
+                if float(np.linalg.norm(refine)) <= max(18.0, 0.65 * spacing):
+                    expected = expected + refine.reshape(1, 2)
+                    offset = offset + refine
+                    local_ids, matched_indices, errors = match_expected_holes(expected, all_points, tolerance)
+
+            matches = len(matched_indices)
+            if matches < min_matches:
+                continue
+            mean_error = float(np.mean(errors)) if errors else float("inf")
+            inferred_center = np.mean(expected, axis=0).astype(np.float32)
+            if not (0.0 <= inferred_center[0] < frame_width and 0.0 <= inferred_center[1] < frame_height):
+                continue
+            score = matches * 1000.0 - mean_error * 70.0 - abs(ratio - 8.0) * 25.0
+            candidate = {
+                "score": float(score),
+                "matches": int(matches),
+                "mean_error_px": mean_error,
+                "spacing_u_px": float(base_grid.get("spacing_u_px", spacing)),
+                "spacing_v_px": float(base_grid.get("spacing_v_px", spacing)),
+                "cos_angle": float(base_grid.get("cos_angle", 0.0)),
+                "p0": np.asarray(base_grid["p0"], dtype=np.float32) + offset,
+                "u": np.asarray(base_grid["u"], dtype=np.float32).copy(),
+                "v": np.asarray(base_grid["v"], dtype=np.float32).copy(),
+                "expected_points": expected.astype(np.float32),
+                "matched_points": all_points[matched_indices].astype(np.float32),
+                "matched_indices": matched_indices,
+                "matched_local_ids": local_ids,
+                "cluster_id": -1,
+                "cluster_size": int(matches),
+                "center": inferred_center,
+                "point_indices": matched_indices,
+                "inferred": True,
+            }
+            if best is None or candidate["score"] > best["score"]:
+                best = candidate
+    return best
+
+
 def grid_json_safe(grid: Dict) -> Dict:
     return {
         "grid_id": int(grid.get("grid_id", 0)),
         "cluster_id": int(grid.get("cluster_id", -1)),
         "cluster_size": int(grid.get("cluster_size", 0)),
+        "inferred": bool(grid.get("inferred", False)),
         "matches": int(grid.get("matches", grid.get("num_matches", 0))),
         "mean_error_px": float(grid.get("mean_error_px", float("nan"))),
         "spacing_u_px": float(grid.get("spacing_u_px", float("nan"))),
@@ -420,7 +652,9 @@ def grid_json_safe(grid: Dict) -> Dict:
         "u": np.asarray(grid.get("u", [float("nan"), float("nan")]), dtype=float).tolist(),
         "v": np.asarray(grid.get("v", [float("nan"), float("nan")]), dtype=float).tolist(),
         "expected_points": np.asarray(grid.get("expected_points", []), dtype=float).reshape(-1, 2).tolist(),
+        "matched_points": np.asarray(grid.get("matched_points", []), dtype=float).reshape(-1, 2).tolist(),
         "point_indices": [int(i) for i in grid.get("point_indices", [])],
+        "matched_local_ids": [int(i) for i in grid.get("matched_local_ids", [])],
     }
 
 
@@ -431,6 +665,8 @@ def grid_from_json(data: Dict) -> Dict:
             out[key] = np.asarray(out[key], dtype=np.float32)
     if "expected_points" in out:
         out["expected_points"] = np.asarray(out["expected_points"], dtype=np.float32).reshape(-1, 2)
+    if "matched_points" in out:
+        out["matched_points"] = np.asarray(out["matched_points"], dtype=np.float32).reshape(-1, 2)
     return out
 
 
@@ -671,7 +907,9 @@ def build_calibration_from_corners(frame: np.ndarray, corners: np.ndarray, sourc
 
 def build_calibration_from_hole_grids(frame: np.ndarray, video: str = "") -> Optional[BoardCalibration]:
     h, w = frame.shape[:2]
-    side_points, _ = detect_bright_hole_candidates(frame)
+    board_hint = auto_detect_board_corners(frame)
+    side_points, _ = detect_hole_candidates(frame)
+    side_points = filter_points_to_polygon(side_points, board_hint, margin_px=10.0)
     clusters = cluster_hole_candidates(side_points, link_distance_px=45.0)
     grids = select_two_hole_grids(
         side_points,
@@ -681,6 +919,18 @@ def build_calibration_from_hole_grids(frame: np.ndarray, video: str = "") -> Opt
         min_matches=7,
         min_grid_separation_px=90.0,
     )
+    if len(grids) == 1:
+        inferred_grid = infer_missing_grid_from_single_grid(
+            grids[0],
+            side_points,
+            frame_width=w,
+            frame_height=h,
+            board_polygon=board_hint,
+            min_matches=3,
+        )
+        if inferred_grid is not None:
+            grids = [grids[0], inferred_grid]
+            grids.sort(key=lambda item: (float(item["center"][0]), float(item["center"][1])))
     if len(grids) < 2:
         return None
 

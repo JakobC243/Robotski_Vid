@@ -21,6 +21,12 @@ Thumbs.db
 *.avi
 *.mov
 *.zip
+*.rar
+*.exe
+
+__MACOSX/
+vaje/
 
 !data/
 !data/**
+vaje/

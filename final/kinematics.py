@@ -52,76 +52,132 @@ class EmaScalar:
 class KinematicsTracker:
     def __init__(self, smooth_alpha: float, smooth_window: int):
         self.center_filter = EmaPoint(smooth_alpha)
+        self.metric_center_filter = EmaPoint(smooth_alpha)
         self.speed_filter = EmaScalar(smooth_alpha)
         self.accel_filter = EmaScalar(smooth_alpha)
         self.thumb_index_filter = EmaScalar(smooth_alpha)
+        self.metric_speed_filter = EmaScalar(smooth_alpha)
+        self.metric_accel_filter = EmaScalar(smooth_alpha)
+        self.thumb_index_mm_filter = EmaScalar(smooth_alpha)
         self.window = max(1, int(smooth_window))
         self.prev_smoothed_center: Optional[Point] = None
+        self.prev_metric_center: Optional[Point] = None
         self.prev_raw_center: Optional[Point] = None
+        self.prev_raw_metric_center: Optional[Point] = None
         self.prev_time: Optional[float] = None
         self.prev_speed: Optional[float] = None
+        self.prev_metric_speed: Optional[float] = None
         self.prev_raw_speed: Optional[float] = None
+        self.prev_raw_metric_speed: Optional[float] = None
         self.last_was_detected = False
+        self.last_metric_was_detected = False
         self.path_length = 0.0
+        self.path_length_mm = 0.0
         self.recent_speeds: Deque[float] = deque(maxlen=self.window)
         self.recent_accels: Deque[float] = deque(maxlen=self.window)
         self.recent_thumb_index: Deque[float] = deque(maxlen=self.window)
+        self.recent_metric_speeds: Deque[float] = deque(maxlen=self.window)
+        self.recent_metric_accels: Deque[float] = deque(maxlen=self.window)
+        self.recent_thumb_index_mm: Deque[float] = deque(maxlen=self.window)
 
     def reset_live_state(self) -> None:
         self.center_filter.reset()
+        self.metric_center_filter.reset()
         self.speed_filter.reset()
         self.accel_filter.reset()
         self.thumb_index_filter.reset()
+        self.metric_speed_filter.reset()
+        self.metric_accel_filter.reset()
+        self.thumb_index_mm_filter.reset()
         self.prev_smoothed_center = None
+        self.prev_metric_center = None
         self.prev_raw_center = None
+        self.prev_raw_metric_center = None
         self.prev_time = None
         self.prev_speed = None
+        self.prev_metric_speed = None
         self.prev_raw_speed = None
+        self.prev_raw_metric_speed = None
         self.last_was_detected = False
+        self.last_metric_was_detected = False
         self.recent_speeds.clear()
         self.recent_accels.clear()
         self.recent_thumb_index.clear()
+        self.recent_metric_speeds.clear()
+        self.recent_metric_accels.clear()
+        self.recent_thumb_index_mm.clear()
 
     def reset(self) -> None:
         self.reset_live_state()
         self.path_length = 0.0
+        self.path_length_mm = 0.0
 
-    def update(self, time_s: float, detected: bool, raw_center: Optional[Point], thumb_index_distance_px: float) -> Dict[str, float]:
+    def _empty_row(self) -> Dict[str, float]:
+        return {
+            "hand_center_x": float("nan"),
+            "hand_center_y": float("nan"),
+            "hand_center_mm_x": float("nan"),
+            "hand_center_mm_y": float("nan"),
+            "path_length_px_cumulative": float(self.path_length),
+            "path_length_mm_cumulative": float(self.path_length_mm),
+            "speed_px_s": float("nan"),
+            "speed_px_s_smooth": float("nan"),
+            "speed_px_s_raw": float("nan"),
+            "speed_mm_s": float("nan"),
+            "speed_mm_s_smooth": float("nan"),
+            "speed_mm_s_raw": float("nan"),
+            "acceleration_px_s2": float("nan"),
+            "acceleration_px_s2_smooth": float("nan"),
+            "acceleration_px_s2_raw": float("nan"),
+            "acceleration_mm_s2": float("nan"),
+            "acceleration_mm_s2_smooth": float("nan"),
+            "acceleration_mm_s2_raw": float("nan"),
+            "thumb_index_distance_px_smooth": float("nan"),
+            "thumb_index_distance_mm_smooth": float("nan"),
+        }
+
+    def reset_metric_live_state(self) -> None:
+        self.metric_center_filter.reset()
+        self.metric_speed_filter.reset()
+        self.metric_accel_filter.reset()
+        self.thumb_index_mm_filter.reset()
+        self.prev_metric_center = None
+        self.prev_raw_metric_center = None
+        self.prev_metric_speed = None
+        self.prev_raw_metric_speed = None
+        self.last_metric_was_detected = False
+        self.recent_metric_speeds.clear()
+        self.recent_metric_accels.clear()
+        self.recent_thumb_index_mm.clear()
+
+    def update(
+        self,
+        time_s: float,
+        detected: bool,
+        raw_center: Optional[Point],
+        thumb_index_distance_px: float,
+        metric_center: Optional[Point] = None,
+        thumb_index_distance_mm: float = float("nan"),
+    ) -> Dict[str, float]:
         if not detected or not finite_point(raw_center):
             self.reset_live_state()
-            return {
-                "hand_center_x": float("nan"),
-                "hand_center_y": float("nan"),
-                "path_length_px_cumulative": float(self.path_length),
-                "speed_px_s": float("nan"),
-                "speed_px_s_smooth": float("nan"),
-                "acceleration_px_s2": float("nan"),
-                "acceleration_px_s2_smooth": float("nan"),
-                "thumb_index_distance_px_smooth": float("nan"),
-                "speed_px_s_raw": float("nan"),
-                "acceleration_px_s2_raw": float("nan"),
-            }
+            return self._empty_row()
 
         smoothed = self.center_filter.update(raw_center)
         if smoothed is None:
             self.last_was_detected = False
-            return {
-                "hand_center_x": float("nan"),
-                "hand_center_y": float("nan"),
-                "path_length_px_cumulative": float(self.path_length),
-                "speed_px_s": float("nan"),
-                "speed_px_s_smooth": float("nan"),
-                "acceleration_px_s2": float("nan"),
-                "acceleration_px_s2_smooth": float("nan"),
-                "thumb_index_distance_px_smooth": float("nan"),
-                "speed_px_s_raw": float("nan"),
-                "acceleration_px_s2_raw": float("nan"),
-            }
+            return self._empty_row()
 
         speed = float("nan")
         speed_raw = float("nan")
         accel = float("nan")
         accel_raw = float("nan")
+        speed_mm = float("nan")
+        speed_mm_raw = float("nan")
+        accel_mm = float("nan")
+        accel_mm_raw = float("nan")
+        metric_smoothed: Optional[Point] = None
+        has_metric = finite_point(metric_center)
         if self.last_was_detected and self.prev_time is not None and self.prev_smoothed_center is not None:
             dt = max(1e-6, float(time_s) - float(self.prev_time))
             step = distance(self.prev_smoothed_center, smoothed)
@@ -135,13 +191,42 @@ class KinematicsTracker:
                 accel = (speed - self.prev_speed) / dt
             if self.prev_raw_speed is not None and np.isfinite(speed_raw):
                 accel_raw = (speed_raw - self.prev_raw_speed) / dt
+            if has_metric:
+                metric_smoothed = self.metric_center_filter.update(metric_center)
+                if (
+                    metric_smoothed is not None
+                    and self.last_metric_was_detected
+                    and self.prev_metric_center is not None
+                ):
+                    metric_step = distance(self.prev_metric_center, metric_smoothed)
+                    if np.isfinite(metric_step):
+                        self.path_length_mm += metric_step
+                        speed_mm = metric_step / dt
+                    if finite_point(self.prev_raw_metric_center):
+                        raw_metric_step = distance(self.prev_raw_metric_center, metric_center)
+                        if np.isfinite(raw_metric_step):
+                            speed_mm_raw = raw_metric_step / dt
+                    if self.prev_metric_speed is not None and np.isfinite(speed_mm):
+                        accel_mm = (speed_mm - self.prev_metric_speed) / dt
+                    if self.prev_raw_metric_speed is not None and np.isfinite(speed_mm_raw):
+                        accel_mm_raw = (speed_mm_raw - self.prev_raw_metric_speed) / dt
+            else:
+                self.reset_metric_live_state()
+        elif has_metric:
+            metric_smoothed = self.metric_center_filter.update(metric_center)
 
         speed_smooth = self.speed_filter.update(speed)
         accel_smooth = self.accel_filter.update(accel)
         thumb_smooth = self.thumb_index_filter.update(thumb_index_distance_px)
+        speed_mm_smooth = self.metric_speed_filter.update(speed_mm)
+        accel_mm_smooth = self.metric_accel_filter.update(accel_mm)
+        thumb_mm_smooth = self.thumb_index_mm_filter.update(thumb_index_distance_mm)
         self.recent_speeds.append(speed_smooth)
         self.recent_accels.append(accel_smooth)
         self.recent_thumb_index.append(thumb_smooth)
+        self.recent_metric_speeds.append(speed_mm_smooth)
+        self.recent_metric_accels.append(accel_mm_smooth)
+        self.recent_thumb_index_mm.append(thumb_mm_smooth)
 
         self.prev_smoothed_center = smoothed
         self.prev_raw_center = raw_center
@@ -151,16 +236,34 @@ class KinematicsTracker:
         if np.isfinite(speed_raw):
             self.prev_raw_speed = speed_raw
         self.last_was_detected = True
+        if metric_smoothed is not None and finite_point(metric_center):
+            self.prev_metric_center = metric_smoothed
+            self.prev_raw_metric_center = metric_center
+            if np.isfinite(speed_mm):
+                self.prev_metric_speed = speed_mm
+            if np.isfinite(speed_mm_raw):
+                self.prev_raw_metric_speed = speed_mm_raw
+            self.last_metric_was_detected = True
 
         return {
             "hand_center_x": float(smoothed[0]),
             "hand_center_y": float(smoothed[1]),
+            "hand_center_mm_x": float(metric_smoothed[0]) if metric_smoothed is not None else float("nan"),
+            "hand_center_mm_y": float(metric_smoothed[1]) if metric_smoothed is not None else float("nan"),
             "path_length_px_cumulative": float(self.path_length),
+            "path_length_mm_cumulative": float(self.path_length_mm),
             "speed_px_s": float(speed),
             "speed_px_s_smooth": float(nanmean(self.recent_speeds)),
+            "speed_px_s_raw": float(speed_raw),
+            "speed_mm_s": float(speed_mm),
+            "speed_mm_s_smooth": float(nanmean(self.recent_metric_speeds)),
+            "speed_mm_s_raw": float(speed_mm_raw),
             "acceleration_px_s2": float(accel),
             "acceleration_px_s2_smooth": float(nanmean(self.recent_accels)),
-            "thumb_index_distance_px_smooth": float(nanmean(self.recent_thumb_index)),
-            "speed_px_s_raw": float(speed_raw),
             "acceleration_px_s2_raw": float(accel_raw),
+            "acceleration_mm_s2": float(accel_mm),
+            "acceleration_mm_s2_smooth": float(nanmean(self.recent_metric_accels)),
+            "acceleration_mm_s2_raw": float(accel_mm_raw),
+            "thumb_index_distance_px_smooth": float(nanmean(self.recent_thumb_index)),
+            "thumb_index_distance_mm_smooth": float(nanmean(self.recent_thumb_index_mm)),
         }

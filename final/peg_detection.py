@@ -81,6 +81,7 @@ class PegOccupancyDetector:
         self.visible: Dict[str, List[int]] = {side: [0] * 9 for side in SIDES}
         self.candidate_states: Dict[str, List[Optional[int]]] = {side: [None] * 9 for side in SIDES}
         self.candidate_counts: Dict[str, List[int]] = {side: [0] * 9 for side in SIDES}
+        self.reference_bootstrap_done: Dict[str, bool] = {side: False for side in SIDES}
         self.last_target_side = ""
         self.target_phase = "tracking"
 
@@ -166,6 +167,91 @@ class PegOccupancyDetector:
         std_change = abs(reference.texture_std - patch.texture_std) / 22.0
         return float(0.42 * texture_change + 0.38 * value_change + 0.12 * edge_change + 0.08 * std_change)
 
+    def _reference_count(self, side: str) -> int:
+        return int(sum(1 for reference in self.references.get(side, []) if reference is not None))
+
+    def _median_reference(self, patches: List[PegPatch]) -> PegPatch:
+        descriptors = np.stack([patch.descriptor for patch in patches], axis=0)
+        return PegPatch(
+            descriptor=np.median(descriptors, axis=0).astype(np.float32),
+            value_median=float(np.median([patch.value_median for patch in patches])),
+            edge_mean=float(np.median([patch.edge_mean for patch in patches])),
+            texture_std=float(np.median([patch.texture_std for patch in patches])),
+        )
+
+    def _bootstrap_from_visible_field(
+        self,
+        frame_bgr: np.ndarray,
+        side: str,
+        grid: PegGrid,
+        target_side: str,
+    ) -> Optional[bool]:
+        patch_items: List[Tuple[int, PegPatch]] = []
+        visible = [0] * 9
+        for idx, point in enumerate(grid.points[:9]):
+            patch = self._patch(frame_bgr, point, grid.sample_radius)
+            if patch is None:
+                continue
+            visible[idx] = 1
+            patch_items.append((idx, patch))
+
+        self.visible[side] = visible
+        if len(patch_items) < 7:
+            self.target_phase = "waiting_clear_reference"
+            return None
+
+        patches = [patch for _, patch in patch_items]
+        pair_scores: List[float] = []
+        for i, patch in enumerate(patches):
+            distances = [
+                self._change_score(other_patch, patch)
+                for j, other_patch in enumerate(patches)
+                if i != j
+            ]
+            pair_scores.append(float(np.median(distances)) if distances else 0.0)
+
+        score_array = np.asarray(pair_scores, dtype=np.float32)
+        median_score = float(np.median(score_array))
+        mad = float(np.median(np.abs(score_array - median_score)))
+        robust_sigma = 1.4826 * mad
+        threshold = max(0.60 * self.change_threshold, median_score + max(0.06, 2.5 * robust_sigma))
+        occupied_flags = [bool(score >= threshold) for score in pair_scores]
+
+        if sum(occupied_flags) == 0 and len(pair_scores) >= 2:
+            ordered = sorted(pair_scores, reverse=True)
+            gap = ordered[0] - ordered[1]
+            strongest_idx = int(np.argmax(score_array))
+            if ordered[0] >= max(0.70 * self.change_threshold, median_score + 0.08) and gap >= 0.05:
+                occupied_flags[strongest_idx] = True
+
+        if sum(occupied_flags) > 4:
+            occupied_flags = [False] * len(occupied_flags)
+
+        empty_patches = [patch for occupied, patch in zip(occupied_flags, patches) if not occupied]
+        if len(empty_patches) < 5:
+            self.target_phase = "waiting_clear_reference"
+            return None
+
+        empty_reference = self._median_reference(empty_patches)
+        baseline_state = self._baseline_state(side, target_side)
+        changed_state = int(1 - baseline_state)
+        boot_updated = False
+
+        self.scores[side] = [float("nan")] * 9
+        for (idx, patch), score, occupied in zip(patch_items, pair_scores, occupied_flags):
+            raw_state = changed_state if occupied else baseline_state
+            self.references[side][idx] = empty_reference if occupied else patch
+            self.scores[side][idx] = float(score)
+            self.candidate_states[side][idx] = raw_state
+            self.candidate_counts[side][idx] = self.stable_frames
+            if self.states[side][idx] != raw_state:
+                self.states[side][idx] = raw_state
+                boot_updated = True
+
+        self.reference_bootstrap_done[side] = True
+        self.target_phase = "non_led_bootstrap" if boot_updated else "non_led_reference"
+        return boot_updated
+
     def _baseline_state(self, side: str, target_side: str) -> int:
         return 0
 
@@ -182,6 +268,7 @@ class PegOccupancyDetector:
             self.visible[side] = [0] * 9
             self.candidate_states[side] = [None] * 9
             self.candidate_counts[side] = [0] * 9
+            self.reference_bootstrap_done[side] = False
 
     def update(
         self,
@@ -189,6 +276,7 @@ class PegOccupancyDetector:
         covered_sides: Set[str],
         target_side: str = "",
         measurement_active: bool = True,
+        reference_bootstrap: bool = False,
     ) -> PegOccupancyInfo:
         if target_side in SIDES:
             self._reset_for_target_side(target_side)
@@ -204,7 +292,18 @@ class PegOccupancyDetector:
 
             if covered.get(side, False):
                 self.visible[side] = [0] * 9
+                if reference_bootstrap and measurement_active and not self.reference_bootstrap_done.get(side, False):
+                    self.target_phase = "waiting_clear_reference"
                 continue
+
+            if reference_bootstrap and measurement_active and not self.reference_bootstrap_done.get(side, False):
+                if self._reference_count(side) >= 7:
+                    self.reference_bootstrap_done[side] = True
+                else:
+                    boot_updated = self._bootstrap_from_visible_field(frame_bgr, side, grid, target_side)
+                    if boot_updated is not None:
+                        updated[side] = bool(updated[side] or boot_updated)
+                    continue
 
             baseline_state = self._baseline_state(side, target_side)
             for idx, point in enumerate(grid.points[:9]):

@@ -96,6 +96,40 @@ def draw_measurement_timer(
     draw_text(image, f"{minutes:02d}:{seconds:05.2f}", (15, y), 0.72, color)
 
 
+def draw_video_name(image: np.ndarray, video_name: str) -> None:
+    if not video_name:
+        return
+    max_chars = max(18, int(image.shape[1] / 13))
+    text = video_name if len(video_name) <= max_chars else "..." + video_name[-(max_chars - 3):]
+    draw_text(image, text, (15, 28), 0.52, (245, 245, 245))
+
+
+def metric_value(value: float, digits: int = 1) -> str:
+    return "nan" if not np.isfinite(value) else f"{float(value):.{digits}f}"
+
+
+def draw_landmark_metrics(image: np.ndarray, landmark_metrics: Optional[Dict[str, Dict[str, float]]]) -> None:
+    if not landmark_metrics:
+        return
+    specs = [
+        ("PAL", "thumb", (80, 220, 255)),
+        ("KAZ", "index", (255, 110, 220)),
+    ]
+    y = 128
+    for label, key, color in specs:
+        values = landmark_metrics.get(key, {})
+        x_mm = metric_value(float(values.get("x_mm", float("nan"))))
+        y_mm = metric_value(float(values.get("y_mm", float("nan"))))
+        path_mm = metric_value(float(values.get("path_mm", float("nan"))))
+        speed_mm_s = metric_value(float(values.get("speed_mm_s", float("nan"))))
+        accel_mm_s2 = metric_value(float(values.get("accel_mm_s2", float("nan"))))
+        draw_text(image, f"{label} pos {x_mm},{y_mm} mm", (15, y), 0.40, color)
+        draw_text(image, f"{label} pot {path_mm} mm", (15, y + 18), 0.40, color)
+        draw_text(image, f"{label} v {speed_mm_s} mm/s", (15, y + 36), 0.40, color)
+        draw_text(image, f"{label} a {accel_mm_s2} mm/s2", (15, y + 54), 0.40, color)
+        y += 80
+
+
 def draw_field_regions(image: np.ndarray, field_regions: Sequence[Dict], hand_field_zone: str) -> None:
     if not field_regions:
         return
@@ -167,10 +201,10 @@ def draw_timeseries_panel(panel: np.ndarray, history: Dict[str, Deque[float]], f
     graph_h = max(54, (panel.shape[0] - 92) // 4)
     y0 = 64
     specs = [
-        ("d(t) path px", "path", (70, 210, 255)),
-        ("v(t) px/s", "speed", (80, 220, 160)),
-        ("a(t) px/s2", "acceleration", (255, 180, 80)),
-        ("thumb-index px", "thumb_index", (220, 130, 255)),
+        ("d(t) path mm", "path", (70, 210, 255)),
+        ("v(t) mm/s", "speed", (80, 220, 160)),
+        ("a(t) mm/s2", "acceleration", (255, 180, 80)),
+        ("thumb-index mm", "thumb_index", (220, 130, 255)),
     ]
     for idx, (title, key, color) in enumerate(specs):
         y = y0 + idx * (graph_h + 28)
@@ -199,13 +233,17 @@ def compose_frame(
     hand_field_zone: str = "",
     peg_detector=None,
     peg_info=None,
+    video_name: str = "",
+    landmark_metrics: Optional[Dict[str, Dict[str, float]]] = None,
 ) -> np.ndarray:
     annotated = frame.copy()
+    draw_video_name(annotated, video_name)
     draw_calibration(annotated, calibration)
     draw_activation_roi(annotated, activation_roi)
     if show_trial_status:
         draw_trial_status(annotated, trial_info)
     draw_measurement_timer(annotated, measurement_started, measurement_completed, measurement_time_s, y=118 if show_trial_status else 88)
+    draw_landmark_metrics(annotated, landmark_metrics)
     draw_field_regions(annotated, field_regions or [], hand_field_zone)
     if peg_detector is not None and peg_info is not None and getattr(peg_info, "measurement_active", False):
         peg_detector.draw(annotated, peg_info)
