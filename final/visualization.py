@@ -22,8 +22,6 @@ def draw_text(image: np.ndarray, text: str, org: Tuple[int, int], scale: float, 
 
 def draw_hand(image: np.ndarray, observation: HandObservation, smoothed_center: Optional[Tuple[float, float]]) -> None:
     if not observation.detected or observation.landmarks_px is None:
-        label = "WAITING FOR HAND IN START ZONE" if observation.waiting_for_start else "NO HAND DETECTED"
-        draw_text(image, label, (15, 58), 0.62, (0, 190, 255))
         return
 
     pts = observation.landmarks_px
@@ -45,22 +43,10 @@ def draw_hand(image: np.ndarray, observation: HandObservation, smoothed_center: 
             radius = 3
         cv2.circle(image, (int(round(point[0])), int(round(point[1]))), radius, color, -1, cv2.LINE_AA)
 
-    for idx, label in [(WRIST, "0"), (THUMB_TIP, "4"), (INDEX_TIP, "8")]:
-        point = pts[idx]
-        cv2.putText(image, label, (int(point[0]) + 4, int(point[1]) - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.34, (245, 245, 245), 1, cv2.LINE_AA)
-
     if smoothed_center is not None and np.all(np.isfinite(smoothed_center)):
         cx, cy = int(round(smoothed_center[0])), int(round(smoothed_center[1]))
         cv2.drawMarker(image, (cx, cy), (0, 255, 255), markerType=cv2.MARKER_CROSS, markerSize=14, thickness=1, line_type=cv2.LINE_AA)
         cv2.circle(image, (cx, cy), 5, (0, 255, 255), 1, cv2.LINE_AA)
-
-    draw_text(
-        image,
-        f"hand={observation.active_hand_label} score={observation.hand_score:.2f} motion={observation.motion_score:.1f}",
-        (15, 58),
-        0.48,
-        (235, 235, 235),
-    )
 
 
 def draw_activation_roi(image: np.ndarray, activation_roi: Optional[ActivationRegion]) -> None:
