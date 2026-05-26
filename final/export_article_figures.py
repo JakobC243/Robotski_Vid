@@ -65,7 +65,7 @@ def plot_trajectory(df: pd.DataFrame, output_path: Path) -> None:
     ax.scatter(x[valid].iloc[-1:], y[valid].iloc[-1:], color="#d62728", s=28, label="konec")
     ax.set_aspect("equal", adjustable="box")
     setup_axes(ax, "x [mm]", "y [mm]")
-    ax.set_title("Trajektorija sredisca roke")
+    ax.set_title("Trajektorija središča roke")
     ax.legend(frameon=False, loc="best")
     fig.savefig(output_path, dpi=220)
     plt.close(fig)
@@ -211,7 +211,7 @@ def main() -> None:
     plot_kinematics(
         run_df,
         out_dir / "hand_kinematics.png",
-        "Kinematika sredisca roke",
+        "Kinematika središča roke",
         ("path_length_mm_cumulative", "speed_mm_s_smooth", "acceleration_mm_s2_smooth"),
     )
     plot_thumb_index_kinematics(run_df, out_dir / "thumb_index_kinematics.png")
