@@ -104,7 +104,7 @@ Ta pristop je uporaben kot dokaz koncepta, vendar ni popolnoma zanesljiv. Zatič
 
 \section{Rezultati}
 
-Rezultati so prikazani na reprezentativnem posnetku, pri katerem je bila kalibracija uspešna, vidna je bila LED sekvenca, roka pa je večino časa ostala v kadru. Sistem je obdelal 687 okvirjev pri frekvenci 25 slik/s. Roka je bila zaznana v 98,8 \% okvirjev. Začetek meritve je bil določen pri 128. okvirju, kar ustreza približno 5,12 s od začetka posnetka. Ciljna stran je bila desna, meritev pa se je zaključila pri 647. okvirju; ocenjeni čas izvedbe je bil 20,76 s.
+Rezultati so prikazani na reprezentativnem posnetku, pri katerem je bila kalibracija uspešna, vidna je bila LED sekvenca, roka pa je večino časa ostala sledljiva. Sistem je obdelal 836 okvirjev pri frekvenci 25 slik/s. Roka je bila zaznana v 83,5 \% okvirjev. Začetek meritve je bil določen pri 116. okvirju, kar ustreza približno 4,64 s od začetka posnetka. Ciljna stran je bila desna, meritev pa se je zaključila pri 795. okvirju; ocenjeni čas izvedbe je bil 27,16 s.
 
 \begin{figure*}[t]
 \begin{center}
@@ -124,16 +124,7 @@ Rezultati so prikazani na reprezentativnem posnetku, pri katerem je bila kalibra
 \end{center}
 \end{figure*}
 
-Slika \ref{fig:frames} prikazuje delovanje kalibracije in zaznave roke na istem tipu posnetka. Kalibrirana območja omogočajo izločitev relevantnih delov slike, zato se pri nadaljnji obdelavi ne obravnava celotna slika, temveč le geometrijsko smiselna območja.
-
-\begin{figure}[htb]
-\centering
-\includegraphics[width=\linewidth]{fig/article/hand_trajectory.png}
-\caption{Trajektorija središča roke v koordinatnem sistemu kalibrirane plošče. Osi so podane v milimetrih.}
-\label{fig:trajectory}
-\end{figure}
-
-Trajektorija na sliki \ref{fig:trajectory} kaže pretežno ponavljajoče se premike med območjem zatičev in ciljnim poljem. Ker je uporabljena ravninska preslikava, so koordinate interpretirane kot projekcija gibanja na ravnino plošče. Iz nje ni mogoče neposredno sklepati o višini roke nad ploščo.
+Slika \ref{fig:frames} prikazuje delovanje kalibracije in zaznave roke na istem tipu posnetka. Kalibrirana območja omogočajo izločitev relevantnih delov slike, zato se pri nadaljnji obdelavi ne obravnava celotna slika, temveč le geometrijsko smiselna območja. Pri prikazu videa je sled središča roke omejena na zadnjih 125 točk, da ostane vidno trenutno gibanje in da se plošča ob koncu posnetka ne prekrije s celotno zgodovino trajektorije.
 
 \begin{figure}[htb]
 \centering
@@ -142,7 +133,7 @@ Trajektorija na sliki \ref{fig:trajectory} kaže pretežno ponavljajoče se prem
 \label{fig:handkin}
 \end{figure}
 
-Na sliki \ref{fig:handkin} so prikazani osnovni kinematični parametri središča roke. Skupna pot v ravnini je znašala približno 4,99 m, povprečna glajena hitrost 236 mm/s, največja glajena hitrost pa približno 1015 mm/s. Pospešek je izrazito nihajoč, kar je pričakovano pri diskretnem odvajanju položaja in pri gibih, ki vsebujejo hitre spremembe smeri. Zato je pospešek bolj občutljiv na šum kot pot ali hitrost.
+Na sliki \ref{fig:handkin} so prikazani osnovni kinematični parametri središča roke. Skupna pot v ravnini je znašala približno 4,99 m, povprečna glajena hitrost 190 mm/s, največja glajena hitrost pa približno 478 mm/s. Pospešek je izrazito nihajoč, kar je pričakovano pri diskretnem odvajanju položaja in pri gibih, ki vsebujejo hitre spremembe smeri. Zato je pospešek bolj občutljiv na šum kot pot ali hitrost.
 
 \begin{figure}[htb]
 \centering
@@ -151,7 +142,31 @@ Na sliki \ref{fig:handkin} so prikazani osnovni kinematični parametri središč
 \label{fig:fingerkin}
 \end{figure}
 
-Slika \ref{fig:fingerkin} prikazuje dodatni podizziv: ločeno kinematiko palca in kazalca. Na izbranem posnetku je bila ocenjena pot palca približno 5,42 m, pot kazalca pa približno 6,13 m. Večja pot kazalca je smiselna, ker je konica kazalca pri prijemu pogosto bolj izpostavljena in opisuje večje lokalne premike kot središče roke.
+Slika \ref{fig:fingerkin} prikazuje dodatni podizziv: ločeno kinematiko palca in kazalca. Na izbranem posnetku je bila ocenjena pot palca približno 5,19 m, pot kazalca pa približno 5,69 m. Večja pot kazalca je smiselna, ker je konica kazalca pri prijemu pogosto bolj izpostavljena in opisuje večje lokalne premike kot središče roke.
+
+\subsection{Skupinska primerjava poti palca in kazalca}
+
+Za dodatno oceno prijema smo na desetih posnetkih treh oseb ločeno izračunali kumulativno pot konice palca in konice kazalca. V študiji so bili uporabljeni posnetki pacientov 007, 009 in 010. Obe točki sta bili vzeti neposredno iz modela MediaPipe Hands, nato pa sta bili s homografijo iz kalibrirane mreže 3x3 pretvorjeni v metrični koordinatni sistem. Razlika je bila normalizirana glede na pot palca:
+\begin{equation}
+    r = 100 \frac{s_k - s_p}{s_p},
+\end{equation}
+pri čemer je $s_k$ pot kazalca, $s_p$ pa pot palca. Pozitivna vrednost zato pomeni, da je kazalec opravil daljšo pot kot palec.
+
+Vsi analizirani posnetki so se v trenutni obdelavi zaključili s prepoznanim koncem poskusa. Povprečna pot palca je bila 4,29 $\pm$ 0,73 m, povprečna pot kazalca pa 4,72 $\pm$ 0,87 m. Kazalec je v povprečju opravil 9,8 $\pm$ 4,4 \% daljšo pot kot palec. Razpon po posnetkih je bil od 5,1 \% do 17,2 \%. Povprečna zaznava roke med celotnimi posnetki je bila 79,5 \%, med samim tekom meritve pa 96,6 \%.
+
+\begin{figure}[htb]
+\centering
+\includegraphics[width=\linewidth]{fig/article/thumb_index_path_percent.png}
+\caption{Normalizirana razlika poti kazalca glede na palec za posamezne posnetke. Pozitivne vrednosti pomenijo daljšo pot kazalca.}
+\label{fig:thumbindexpercent}
+\end{figure}
+
+\begin{figure}[htb]
+\centering
+\includegraphics[width=0.82\linewidth]{fig/article/thumb_index_path_scatter.png}
+\caption{Primerjava absolutne poti palca in kazalca. Črtkana diagonala označuje enako pot obeh prstov.}
+\label{fig:thumbindexscatter}
+\end{figure}
 
 \begin{figure}[htb]
 \centering
@@ -162,6 +177,17 @@ Slika \ref{fig:fingerkin} prikazuje dodatni podizziv: ločeno kinematiko palca i
 
 Slika \ref{fig:led} prikazuje časovni potek LED ocen. Začetek ni določen pri prvem svetlem signalu, temveč šele po zaporedju obeh prižganih polj, ugasnitve in nato stabilne ciljne strani. Tak pristop zmanjša verjetnost napačnega začetka zaradi kratkotrajnih sprememb svetlosti.
 
+\subsection{Primerjava z ročnimi časi}
+
+Za informativno preverjanje trajanja poskusa so bili avtomatsko izmerjeni časi primerjani z ročnimi skupnimi časi iz merilnih datotek. Posnetki so bili s posameznimi ponovitvami uparjeni po vrstnem redu snemanja. Povprečni ročni čas je bil 19,42 s, povprečni avtomatski čas pa 23,49 s. Povprečno odstopanje avtomatske meritve je bilo +4,07 $\pm$ 3,09 s, povprečna absolutna napaka pa 4,32 s. Rezultat kaže, da je zaznava začetka iz LED sekvence stabilna, večji del razlike pa izvira iz zaznave konca, kjer sistem čaka na stabilno stanje zatičev oziroma praznega ciljnega polja.
+
+\begin{figure}[htb]
+\centering
+\includegraphics[width=\linewidth]{fig/article/manual_time_comparison.png}
+\caption{Informativna primerjava avtomatsko izmerjenega časa z ročnimi skupnimi časi posameznih ponovitev.}
+\label{fig:manualtime}
+\end{figure}
+
 \begin{figure}[htb]
 \centering
 \includegraphics[width=\linewidth]{fig/article/peg_detection_experiment.png}
@@ -169,7 +195,7 @@ Slika \ref{fig:led} prikazuje časovni potek LED ocen. Začetek ni določen pri 
 \label{fig:peg}
 \end{figure}
 
-Na sliki \ref{fig:peg} je prikazan primer eksperimentalne zaznave zatičev. Na tem posnetku je metoda sledila postopnemu naraščanju števila zaznanih zatičev in dosegla vrednost devet, vendar ta rezultat ne pomeni splošne robustnosti. Delovanje je odvisno od stabilnosti osvetlitve, vidnosti lukenj in tega, ali roka po odlaganju dovolj jasno zapusti ciljno polje.
+Na sliki \ref{fig:peg} je prikazan primer eksperimentalne zaznave zatičev. Na tem posnetku je metoda sledila postopnemu naraščanju števila zaznanih zatičev in dosegla vrednost osem, vendar ta rezultat ne pomeni splošne robustnosti. Delovanje je odvisno od stabilnosti osvetlitve, vidnosti lukenj in tega, ali roka po odlaganju dovolj jasno zapusti ciljno polje.
 
 \section{Razprava}
 
@@ -178,6 +204,8 @@ Največja prednost uporabe MediaPipe je strukturirana zaznava roke brez ročne s
 Poseben problem je preskok zaznave na drugo roko. Če sta v kadru obe roki, lahko model v posameznem okvirju poda višjo zanesljivost za napačno roko. Zato je pomembno, da sledenje ne temelji samo na oznaki leve ali desne roke, temveč na kontinuiteti položaja, lokalnem gibanju in območju merilne plošče. Mehka omejitev območja zanimanja je pri tem kompromis: preprečuje nenadne preskoke na oddaljeno roko, hkrati pa ne prekine sledi takoj, ko roka delno zapusti območje.
 
 Vpliv osvetlitve je dvojen. Pri LED sekvenci so svetlobne spremembe namerni signal in se pojavljajo na znanih mestih, zato je mogoče uporabiti lokalne primerjave in stroj stanj. Zaznava začetka je zato razmeroma robustna. Pri zatičih pa sprememba ni tako izrazita: zatič je majhen, njegova barva se lahko zlije z okolico, luknjo lahko zakrije senca ali prst, odsev na plošči pa lahko povzroči podobno spremembo kot dejanska prisotnost zatiča. Zato zaznava zatiča v luknji ostane manj zanesljiva in mora biti predstavljena kot eksperimentalna.
+
+Primerjava z ročnimi meritvami dodatno pokaže, da je za klinično uporabno meritev najpomembnejša robustna zaznava konca. Avtomatska meritev je bila v analiziranem vzorcu v povprečju daljša od ročne, kar je skladno s tem, da algoritem ne zaključi meritve ob prvem možnem znaku konca, temveč zahteva stabilno stanje ciljnega polja. Takšna zahteva zmanjša možnost prezgodnjega zaključka, vendar lahko poveča izmerjeni čas.
 
 Omejitev enega pogleda kamere je, da sistem meri le projekcijo gibanja na ravnino. Hitri dvigi roke nad ploščo, spremembe višine in nagib prstov niso neposredno merljivi. Homografija dobro popravi perspektivo za točke, ki ležijo na plošči, vendar se roka in prsti gibljejo nad ploščo. Posledično so metrične koordinate približek ravninske projekcije, ne popolna tridimenzionalna rekonstrukcija.
 

@@ -4,6 +4,46 @@ Aktualna koda za nalogo je v mapi `final/`. Namen pipeline-a je obdelava videov
 9-hole peg testa: kalibracija plosce, sledenje roke, start casa iz LED sekvence,
 zaznava zaticov v 3x3 polju in izvoz anotiranega videa ter CSV meritev.
 
+## Docker quick start za Linux
+
+Celotna navodila so v `final/README.md`. Minimalni zagon:
+
+```bash
+docker build -t rv-9hpt .
+mkdir -p outputs
+
+docker run --rm \
+  -v "$(pwd)":/workspace \
+  rv-9hpt \
+  python final/run_hand_pipeline.py \
+    --input /workspace/data/patient_010/patient_010camP_1_20231130_12_54_11.mp4 \
+    --output /workspace/outputs/p010_camP1_annotated.mp4 \
+    --csv-output /workspace/outputs/p010_camP1_measurements.csv \
+    --calibration-output /workspace/outputs/p010_camP1_calibration.json \
+    --rotate-clockwise
+```
+
+Ce je vhodni posnetek izven projekta, mountaj njegovo mapo kot `/input` in
+izhodno mapo kot `/output`:
+
+```bash
+docker run --rm \
+  -v "$(pwd)":/workspace \
+  -v "/ABS/POT/DO/VIDEO_MAPE":/input:ro \
+  -v "/ABS/POT/DO/IZHODNE_MAPE":/output \
+  rv-9hpt \
+  python final/run_hand_pipeline.py \
+    --input /input/IME_VIDEA.mp4 \
+    --output /output/IME_VIDEA_annotated.mp4 \
+    --csv-output /output/IME_VIDEA_measurements.csv \
+    --calibration-output /output/IME_VIDEA_calibration.json \
+    --rotate-clockwise
+```
+
+Popravi predvsem `--input`, `--output`, `--csv-output` in
+`--calibration-output`. Ce video ni treba zavrteti, odstrani
+`--rotate-clockwise`.
+
 ## Kaj trenutno dela
 
 `final/run_hand_pipeline.py` je glavni program.

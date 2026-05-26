@@ -1,59 +1,221 @@
 # Final 9HPT pipeline
 
-Ta mapa vsebuje aktualno kodo za obdelavo 9-hole peg test videov. Glavni vstop
-je `run_hand_pipeline.py`; root `README.md` vsebuje celotna navodila za zagon.
+Ta mapa vsebuje aktualno kodo za obdelavo videoposnetkov testa devetih zatičev
+(9-hole peg test). Glavni program je:
 
-## Hiter zagon
-
-Iz korena projekta:
-
-```powershell
-.\.venv311\Scripts\python.exe .\final\run_hand_pipeline.py `
-  --input .\data\patient_001\patient_001camP_1_20241121_10_21_17.mp4 `
-  --output .\outputs\p001_camP1_final.mp4 `
-  --csv-output .\outputs\p001_camP1_final.csv `
-  --calibration-output .\outputs\p001_camP1_calibration.json `
-  --rotate-clockwise
+```bash
+python final/run_hand_pipeline.py
 ```
 
-Za odrezane videe brez LED zacetka:
+Pipeline trenutno izvede:
 
-```powershell
-.\.venv311\Scripts\python.exe .\final\run_hand_pipeline.py `
-  --input .\data\patient_004\patient_004camP_1_20241010_14_47_20.mp4 `
-  --output .\outputs\p004_camP1_fallback.mp4 `
-  --csv-output .\outputs\p004_camP1_fallback.csv `
-  --calibration-output .\outputs\p004_camP1_fallback_calibration.json `
-  --rotate-clockwise `
-  --hand-field-start-fallback on
+- kalibracijo plošče iz dveh mrež lukenj velikosti 3 x 3,
+- zaznavo začetka meritve iz LED sekvence,
+- sledenje roke z MediaPipe,
+- pretvorbo koordinat v mm s homografijo iz mreže 3 x 3, kjer je razmik
+  sosednjih lukenj 32 mm,
+- pot, hitrost in pospešek roke, palca in kazalca,
+- eksperimentalno zaznavo zatičev v ciljnem 3 x 3 polju,
+- anotiran video, CSV meritev in JSON kalibracijo.
+
+## Docker na Linuxu
+
+Iz korena projekta, kjer sta `Dockerfile` in mapa `final/`, najprej zgradi
+Docker image:
+
+```bash
+docker build -t rv-9hpt .
+```
+
+Nato pripravi izhodno mapo, na primer:
+
+```bash
+mkdir -p /home/prof/rv_outputs
+```
+
+## Najbolj enostaven zagon
+
+Podatki niso del repozitorija, zato je priporočeno ločeno priklopiti mapo z
+vhodnimi videoposnetki in mapo za rezultate. V spodnjem ukazu popravi samo:
+
+- `/ABS/POT/DO/VIDEO_MAPE`,
+- `/ABS/POT/DO/IZHODNE_MAPE`,
+- `IME_VIDEA.mp4`.
+
+```bash
+docker run --rm \
+  -v "$(pwd)":/workspace \
+  -v "/ABS/POT/DO/VIDEO_MAPE":/input:ro \
+  -v "/ABS/POT/DO/IZHODNE_MAPE":/output \
+  rv-9hpt \
+  python final/run_hand_pipeline.py \
+    --input /input/IME_VIDEA.mp4 \
+    --output /output/IME_VIDEA_annotated.mp4 \
+    --csv-output /output/IME_VIDEA_measurements.csv \
+    --calibration-output /output/IME_VIDEA_calibration.json \
+    --rotate-clockwise
+```
+
+Primer:
+
+```bash
+mkdir -p /home/prof/rv_outputs
+
+docker run --rm \
+  -v "$(pwd)":/workspace \
+  -v "/home/prof/videos":/input:ro \
+  -v "/home/prof/rv_outputs":/output \
+  rv-9hpt \
+  python final/run_hand_pipeline.py \
+    --input /input/patient_010camP_1_20231130_12_54_11.mp4 \
+    --output /output/patient_010camP_1_annotated.mp4 \
+    --csv-output /output/patient_010camP_1_measurements.csv \
+    --calibration-output /output/patient_010camP_1_calibration.json \
+    --rotate-clockwise
+```
+
+Če pot vsebuje presledke, naj ostane v narekovajih v `-v` delu ukaza.
+
+## Če je video v projektu
+
+Če so vhodni videoposnetki lokalno že v mapi projekta, lahko namesto ločenega
+`/input` priklopa uporabiš tudi pot znotraj `/workspace`:
+
+```bash
+docker run --rm \
+  -v "$(pwd)":/workspace \
+  rv-9hpt \
+  python final/run_hand_pipeline.py \
+    --input /workspace/data/patient_010/patient_010camP_1_20231130_12_54_11.mp4 \
+    --output /workspace/outputs/p010_camP1_annotated.mp4 \
+    --csv-output /workspace/outputs/p010_camP1_measurements.csv \
+    --calibration-output /workspace/outputs/p010_camP1_calibration.json \
+    --rotate-clockwise
+```
+
+## Odrezan video brez LED začetka
+
+Privzeto se čas začne iz LED sekvence. Če je posnetek odrezan in na začetku ni
+vidnega LED zaporedja, dodaj:
+
+```bash
+--hand-field-start-fallback on
+```
+
+Celoten primer:
+
+```bash
+docker run --rm \
+  -v "$(pwd)":/workspace \
+  -v "/ABS/POT/DO/VIDEO_MAPE":/input:ro \
+  -v "/ABS/POT/DO/IZHODNE_MAPE":/output \
+  rv-9hpt \
+  python final/run_hand_pipeline.py \
+    --input /input/IME_ODREZANEGA_VIDEA.mp4 \
+    --output /output/IME_ODREZANEGA_VIDEA_annotated.mp4 \
+    --csv-output /output/IME_ODREZANEGA_VIDEA_measurements.csv \
+    --calibration-output /output/IME_ODREZANEGA_VIDEA_calibration.json \
+    --rotate-clockwise \
+    --hand-field-start-fallback on
+```
+
+## Ponovna uporaba kalibracije
+
+Če želiš isti video ali isti pogled pognati še enkrat z že shranjeno
+kalibracijo, uporabi `--calibration-input`.
+
+```bash
+docker run --rm \
+  -v "$(pwd)":/workspace \
+  -v "/ABS/POT/DO/VIDEO_MAPE":/input:ro \
+  -v "/ABS/POT/DO/IZHODNE_MAPE":/output \
+  rv-9hpt \
+  python final/run_hand_pipeline.py \
+    --input /input/IME_VIDEA.mp4 \
+    --output /output/IME_VIDEA_annotated_v2.mp4 \
+    --csv-output /output/IME_VIDEA_measurements_v2.csv \
+    --calibration-input /output/IME_VIDEA_calibration.json \
+    --rotate-clockwise
+```
+
+## Izhodi
+
+Vsak zagon naredi:
+
+- anotiran video (`--output`),
+- CSV z meritvami po okvirjih (`--csv-output`),
+- JSON kalibracijo (`--calibration-output`, če je podan in se kalibracija
+  izračuna v tem zagonu).
+
+Na videu so prikazani:
+
+- ime vhodnega videa,
+- stoparica poskusa,
+- kalibracija in ciljne luknje,
+- MediaPipe roka,
+- omejena sled roke,
+- polni in prazni zatiči kot eksperimentalna zaznava,
+- grafi v mm, mm/s in mm/s2,
+- pozicija, pot, hitrost in pospešek palca ter kazalca.
+
+Pomembni CSV stolpci:
+
+- `measurement_time_s`, `measurement_start_source`, `measurement_target_side`,
+- `trial_started`, `trial_side`, `trial_start_frame`,
+- `hand_center_mm_x`, `hand_center_mm_y`,
+- `path_length_mm_cumulative`,
+- `speed_mm_s_smooth`, `acceleration_mm_s2_smooth`,
+- `thumb_tip_mm_x_smooth`, `thumb_tip_mm_y_smooth`,
+- `thumb_tip_path_mm_cumulative`, `thumb_tip_speed_mm_s_smooth`,
+- `thumb_tip_acceleration_mm_s2_smooth`,
+- `index_tip_mm_x_smooth`, `index_tip_mm_y_smooth`,
+- `index_tip_path_mm_cumulative`, `index_tip_speed_mm_s_smooth`,
+- `index_tip_acceleration_mm_s2_smooth`,
+- `thumb_index_distance_mm`, `thumb_index_distance_mm_smooth`,
+- `peg_target_count`, `peg_left_count`, `peg_right_count`,
+- `peg_left_0` do `peg_left_8`, `peg_right_0` do `peg_right_8`.
+
+## Glavni parametri
+
+- `--rotate-clockwise`: zavrti video za 90 stopinj v smeri urinega kazalca.
+- `--hole-spacing-mm 32`: fizični razmik med sosednjima luknjama v 3 x 3 polju.
+- `--calibration-scan-frames 60`: koliko začetnih okvirjev pregleda za
+  kalibracijo.
+- `--calibration-scan-step 5`: korak med okvirji pri iskanju kalibracije.
+- `--trail-length 125`: koliko zadnjih točk sledi roke ostane narisanih na
+  videu.
+- `--hand-field-start-fallback on`: uporabi samo za odrezane videe brez LED
+  začetka.
+- `--show-light-zones`: nariše LED diagnostične cone.
+- `--show-field-zones`: nariše 3 x 3 polja za diagnostiko.
+- `--show-trial-status`: prikaže debug tekst LED start detektorja.
+
+## Lokalni zagon brez Dockerja
+
+Če se program poganja brez Dockerja, je priporočen Python 3.11:
+
+```bash
+python3.11 -m venv .venv311
+./.venv311/bin/python -m pip install --upgrade pip
+./.venv311/bin/python -m pip install -r final/requirements.txt
+
+./.venv311/bin/python final/run_hand_pipeline.py \
+  --input data/patient_010/patient_010camP_1_20231130_12_54_11.mp4 \
+  --output outputs/p010_camP1_annotated.mp4 \
+  --csv-output outputs/p010_camP1_measurements.csv \
+  --calibration-output outputs/p010_camP1_calibration.json \
+  --rotate-clockwise
 ```
 
 ## Moduli
 
-- `run_hand_pipeline.py`: CLI, glavna frame zanka, timer, CSV, video output.
-- `calibration.py`: kalibracija plosce iz 3x3 lukenj, rob plosce, fallback.
-- `hand_tracking.py`: MediaPipe Hands, zaklep aktivne roke, soft ROI.
+- `run_hand_pipeline.py`: CLI, glavna zanka po okvirjih, timer, CSV in video
+  output.
+- `calibration.py`: kalibracija plošče iz 3 x 3 lukenj, rob plošče in fallback.
+- `hand_tracking.py`: MediaPipe Hands, zaklep aktivne roke in soft ROI.
 - `trial_timing.py`: LED start sekvenca.
-- `peg_detection.py`: zaznava zaticov samo na ciljni 3x3 strani.
-- `kinematics.py`: pot, hitrost, pospesek, razdalja palec-kazalec.
-- `visualization.py`: overlay roke, lukenj, stoparice in grafov.
+- `peg_detection.py`: eksperimentalna zaznava zatičev samo na ciljni 3 x 3
+  strani.
+- `kinematics.py`: pot, hitrost, pospešek, palec in kazalec.
+- `visualization.py`: overlay roke, lukenj, stoparice, grafov in metrik.
 - `utils.py`: rotacija in video helperji.
-
-## Trenutno vedenje
-
-- Kalibracija pregleda vec zacetnih frame-ov in izbere najboljsi par 3x3 mrez.
-- Grafi na videu so v metricnih enotah: pot v mm, hitrost v mm/s, pospesek v
-  mm/s2 in razdalja palec-kazalec v mm. Pretvorba ni en sam faktor `px`,
-  ampak homografija iz kalibrirane 3x3 mreze, kjer je razmik sosednjih lukenj
-  32 mm.
-- LED start je privzet in najbolj zaupanja vreden nacin za zacetek stoparice.
-- `--hand-field-start-fallback on` je namenjen samo odrezanim posnetkom brez
-  LED zacetka.
-- Pri fallback startu detektor zaticov po prvem odhodu roke iz 3x3 polja
-  primerja vseh 9 lukenj med sabo, da prvi ze odlozeni zatic ne postane prazna
-  referenca.
-- Timer se ustavi, ko je bilo dosezenih vsaj 8 zaticov in se ciljno polje nato
-  stabilno izprazni.
-
-Za vec primerov, parametre, CSV stolpce in seznam datotek za ciscenje glej
-`README.md` v korenu projekta.

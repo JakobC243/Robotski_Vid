@@ -14,7 +14,7 @@ from hand_tracking import MediaPipeHandTracker
 from kinematics import KinematicsTracker
 from peg_detection import PegOccupancyDetector
 from trial_timing import TrialLightStartDetector
-from utils import distance, ensure_parent, finite_point, open_video_writer, rotate_if_needed
+from utils import distance, finite_point, open_video_writer, rotate_if_needed, unique_output_path
 from visualization import PANEL_WIDTH, compose_frame
 
 
@@ -32,7 +32,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-frames", type=int, default=0, help="Optional frame limit for testing. 0 means full video.")
     parser.add_argument("--smooth-window", type=int, default=7, help="Moving average window for graph values.")
     parser.add_argument("--smooth-alpha", type=float, default=0.35, help="EMA alpha for live coordinate and metric smoothing.")
-    parser.add_argument("--trail-length", type=int, default=200, help="Number of smoothed hand center points shown as trajectory.")
+    parser.add_argument("--trail-length", type=int, default=125, help="Number of smoothed hand center points shown as trajectory.")
     parser.add_argument("--start-gate", choices=["center", "none"], default="center", help="Wait until a hand enters the center board zone before locking the active hand.")
     parser.add_argument("--start-gate-scale", type=float, default=0.75, help="Relative size of the expanded center start zone inside the board ROI.")
     parser.add_argument("--start-gate-padding", type=float, default=0.15, help="Relative padding added around the hole-based center start zone used for initial hand lock.")
@@ -237,6 +237,11 @@ def lit_single_side(trial_info) -> str:
     if right_on and not left_on:
         return "right"
     return ""
+
+
+def report_output_path(requested: Path, selected: Path, label: str) -> None:
+    if selected != requested:
+        print(f"{label} already exists, using: {selected}")
 
 
 def empty_kinematics_row(path_length: float = 0.0) -> Dict[str, float]:
@@ -505,13 +510,26 @@ def print_summary(
 def main() -> None:
     args = parse_args()
     input_path = Path(args.input)
-    output_path = Path(args.output)
-    csv_output_path = Path(args.csv_output)
-    calibration_output_path = Path(args.calibration_output) if args.calibration_output else None
-    ensure_parent(output_path)
-    ensure_parent(csv_output_path)
-    if calibration_output_path is not None:
-        ensure_parent(calibration_output_path)
+    requested_output_path = Path(args.output)
+    requested_csv_output_path = Path(args.csv_output)
+    requested_calibration_output_path = Path(args.calibration_output) if args.calibration_output else None
+    reserved_output_paths = set()
+    output_path = unique_output_path(requested_output_path, reserved_output_paths)
+    csv_output_path = unique_output_path(requested_csv_output_path, reserved_output_paths)
+    should_write_calibration = bool(requested_calibration_output_path is not None and not args.calibration_input)
+    calibration_output_path = (
+        unique_output_path(requested_calibration_output_path, reserved_output_paths)
+        if should_write_calibration and requested_calibration_output_path is not None
+        else requested_calibration_output_path
+    )
+    report_output_path(requested_output_path, output_path, "Video output")
+    report_output_path(requested_csv_output_path, csv_output_path, "CSV output")
+    if should_write_calibration and requested_calibration_output_path is not None and calibration_output_path is not None:
+        report_output_path(requested_calibration_output_path, calibration_output_path, "Calibration output")
+    args.output = str(output_path)
+    args.csv_output = str(csv_output_path)
+    if should_write_calibration and calibration_output_path is not None:
+        args.calibration_output = str(calibration_output_path)
 
     cap = cv2.VideoCapture(str(input_path))
     if not cap.isOpened():

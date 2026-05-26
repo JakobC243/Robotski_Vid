@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import math
 from pathlib import Path
-from typing import Iterable, Optional, Sequence, Tuple
+from typing import Iterable, Optional, Sequence, Set, Tuple
 
 import cv2
 import numpy as np
@@ -13,6 +13,28 @@ Point = Tuple[float, float]
 
 def ensure_parent(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+
+
+def output_path_key(path: Path) -> str:
+    return str(path.resolve(strict=False)).casefold()
+
+
+def unique_output_path(path: Path, reserved: Optional[Set[str]] = None) -> Path:
+    ensure_parent(path)
+    reserved_keys = reserved if reserved is not None else set()
+    candidate = path
+    candidate_key = output_path_key(candidate)
+    if not candidate.exists() and candidate_key not in reserved_keys:
+        reserved_keys.add(candidate_key)
+        return candidate
+
+    for idx in range(1, 10000):
+        candidate = path.with_name(f"{path.stem}_{idx}{path.suffix}")
+        candidate_key = output_path_key(candidate)
+        if not candidate.exists() and candidate_key not in reserved_keys:
+            reserved_keys.add(candidate_key)
+            return candidate
+    raise RuntimeError(f"Could not find a free output path for: {path}")
 
 
 def rotate_if_needed(frame: np.ndarray, rotate_clockwise: bool) -> np.ndarray:
