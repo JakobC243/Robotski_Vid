@@ -87,7 +87,7 @@ def draw_trial_status(image: np.ndarray, trial_info) -> None:
     trial_time = float(getattr(trial_info, "trial_time_s", np.nan))
     state = str(getattr(trial_info, "state", ""))
     if started and np.isfinite(trial_time):
-        text = "CAS TECE"
+        text = "STARTED"
         color = (80, 255, 130)
     else:
         text = f"WAIT LIGHT START  {state}"
@@ -104,9 +104,10 @@ def draw_measurement_timer(
 ) -> None:
     if not measurement_started or not np.isfinite(measurement_time_s):
         return
-    label = "KONEC" if measurement_completed else "CAS"
     color = (90, 190, 255) if measurement_completed else (80, 255, 130)
-    draw_text(image, f"{label} {measurement_time_s:.2f}s", (15, y), 0.62, color)
+    minutes = int(measurement_time_s // 60.0)
+    seconds = measurement_time_s - 60.0 * float(minutes)
+    draw_text(image, f"{minutes:02d}:{seconds:05.2f}", (15, y), 0.72, color)
 
 
 def draw_field_regions(image: np.ndarray, field_regions: Sequence[Dict], hand_field_zone: str) -> None:
