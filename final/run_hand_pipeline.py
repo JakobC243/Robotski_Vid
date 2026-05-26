@@ -12,6 +12,7 @@ import pandas as pd
 from calibration import BoardCalibration, ImageRegion, calibrate_frame, load_calibration, save_calibration
 from hand_tracking import MediaPipeHandTracker
 from kinematics import KinematicsTracker
+from peg_detection import PegOccupancyDetector
 from trial_timing import TrialLightStartDetector
 from utils import ensure_parent, finite_point, open_video_writer, rotate_if_needed
 from visualization import PANEL_WIDTH, compose_frame
@@ -51,6 +52,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--show-light-zones", action="store_true", help="Draw LED detector zones and point samples on the output video.")
     parser.add_argument("--show-field-zones", action="store_true", help="Draw 3x3 hand-in-field diagnostic zones and ROKA LEVO/DESNO text on the output video.")
     parser.add_argument("--field-roi-padding", type=float, default=0.75, help="Padding in hole-spacing units around each 3x3 pin field for the first hand-in-field diagnostic.")
+    parser.add_argument("--peg-detection", choices=["on", "off"], default="on", help="Detect inserted pegs from stable local changes around calibrated 3x3 holes.")
+    parser.add_argument("--peg-stable-frames", type=int, default=5, help="Stable frames needed before a peg hole changes occupied/empty state.")
+    parser.add_argument("--peg-change-threshold", type=float, default=0.32, help="Local patch-change threshold for peg occupancy.")
     parser.add_argument("--light-delta-threshold", type=float, default=22.0, help="Brightness increase over baseline needed to mark a light field as on.")
     parser.add_argument("--light-side-gap-threshold", type=float, default=1.0, help="Minimum baseline-relative brightness gap between sides when deciding which single side is on.")
     parser.add_argument("--both-light-frames", type=int, default=3, help="Stable frames needed for the initial both-fields-on event.")
@@ -116,6 +120,16 @@ def hand_field_contact(observation, field_regions: List[Dict]) -> Tuple[str, Dic
     return "", counts
 
 
+def covered_sides_from_hand_field(hand_field_zone: str) -> set:
+    if hand_field_zone == "left":
+        return {"left"}
+    if hand_field_zone == "right":
+        return {"right"}
+    if hand_field_zone == "both":
+        return {"left", "right", "both"}
+    return set()
+
+
 def empty_kinematics_row(path_length: float = 0.0) -> Dict[str, float]:
     return {
         "hand_center_x": float("nan"),
@@ -142,6 +156,7 @@ def build_row(
     trial_info,
     hand_field_zone: str,
     hand_field_counts: Dict[str, int],
+    peg_info,
 ) -> Dict[str, object]:
     raw_center = observation.center_raw if observation.detected else None
     wrist = observation.wrist if observation.detected else None
@@ -205,6 +220,8 @@ def build_row(
     }
     if trial_info is not None:
         row.update(trial_info.to_row())
+    if peg_info is not None:
+        row.update(peg_info.to_row())
     return row
 
 
@@ -289,6 +306,15 @@ def main() -> None:
     start_activation_roi = activation_roi_from_calibration(calibration, args.start_gate_padding)
     tracking_roi = padded_board_roi(calibration, args.tracking_roi_padding)
     field_regions = calibration.hole_grid_regions(padding_scale=args.field_roi_padding)
+    peg_detector = (
+        PegOccupancyDetector(
+            calibration=calibration,
+            stable_frames=args.peg_stable_frames,
+            change_threshold=args.peg_change_threshold,
+        )
+        if args.peg_detection == "on"
+        else None
+    )
 
     writer = open_video_writer(output_path, fps, (frame_w + PANEL_WIDTH, frame_h))
     trial_detector = (
@@ -370,6 +396,15 @@ def main() -> None:
                 kin = kinematics.update(measurement_time_s, observation.detected, observation.center_raw, observation.thumb_index_distance_px)
             else:
                 kin = empty_kinematics_row()
+            peg_info = None
+            if peg_detector is not None:
+                target_side = str(getattr(trial_info, "trial_side", "")) if trial_info is not None else ""
+                peg_info = peg_detector.update(
+                    frame,
+                    covered_sides=covered_sides_from_hand_field(hand_field_zone),
+                    target_side=target_side,
+                    measurement_active=measurement_active,
+                )
             smoothed_center = None
             if measurement_active and np.isfinite(kin["hand_center_x"]) and np.isfinite(kin["hand_center_y"]):
                 smoothed_center = (float(kin["hand_center_x"]), float(kin["hand_center_y"]))
@@ -381,7 +416,7 @@ def main() -> None:
                 history["acceleration"].append(float(kin["acceleration_px_s2_smooth"]))
                 history["thumb_index"].append(float(kin["thumb_index_distance_px_smooth"]))
 
-            rows.append(build_row(frame_idx, time_s, measurement_active, measurement_time_s, observation, kin, calibration, trial_info, hand_field_zone, hand_field_counts))
+            rows.append(build_row(frame_idx, time_s, measurement_active, measurement_time_s, observation, kin, calibration, trial_info, hand_field_zone, hand_field_counts, peg_info))
             display_frame = frame.copy()
             if args.show_light_zones and trial_detector is not None and trial_info is not None:
                 trial_detector.draw_zones(display_frame, trial_info)
@@ -399,6 +434,8 @@ def main() -> None:
                 show_trial_status=args.show_trial_status,
                 field_regions=field_regions if args.show_field_zones else [],
                 hand_field_zone=hand_field_zone if args.show_field_zones else "",
+                peg_detector=peg_detector,
+                peg_info=peg_info,
             )
             writer.write(composed)
             if show_ok:

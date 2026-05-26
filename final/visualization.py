@@ -204,6 +204,8 @@ def compose_frame(
     show_trial_status: bool = False,
     field_regions: Optional[List[Dict]] = None,
     hand_field_zone: str = "",
+    peg_detector=None,
+    peg_info=None,
 ) -> np.ndarray:
     annotated = frame.copy()
     draw_calibration(annotated, calibration)
@@ -211,6 +213,8 @@ def compose_frame(
     if show_trial_status:
         draw_trial_status(annotated, trial_info)
     draw_field_regions(annotated, field_regions or [], hand_field_zone)
+    if peg_detector is not None and peg_info is not None and getattr(peg_info, "measurement_active", False):
+        peg_detector.draw(annotated, peg_info)
     draw_trail(annotated, trail)
     draw_hand(annotated, observation, smoothed_center)
     panel = np.zeros((annotated.shape[0], PANEL_WIDTH, 3), dtype=np.uint8)
